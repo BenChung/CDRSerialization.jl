@@ -38,8 +38,8 @@
     RTPS_PL_CDR2_LE = 0x0b
 end
 
-mutable struct CDRReader{A <: AbstractArray{UInt8}}
-    buf::A
+mutable struct CDRReader{B <: IO}
+    src::B
 
     littleEndian::Bool
     eightByteAlignment::Int
@@ -48,24 +48,25 @@ mutable struct CDRReader{A <: AbstractArray{UInt8}}
     usesMemberHeader::Bool
 
     origin::Int
-    offset::Int
 
     kind::EncapsulationKind
 
-    function CDRReader(buf::A) where A <: AbstractArray{UInt8}
-        if (length(buf) < 4)
-            throw("Invalid CDR data size, must have at least 4 bytes")
+    function CDRReader(buf::A) where A <: IO
+        preamble = Ref{Int64}(0)
+        nb = unsafe_read(buf, preamble, 4)
+        if nb != 4
+            throw("Invalid CDR header (buffer too small)")
         end
-        kind = buf[2]
+        kind = (preamble >> 24) & 0xFF
         isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(kind)
-        new{A}(buf, littleEndian, isCDR2 ? 4 : 8, isCDR2, usesDelimiterHeader, usesMemberHeader, 5, 5, EncapsulationKind(kind)) # julia is 1-indexed
+        new{A}(buf, littleEndian, isCDR2 ? 4 : 8, isCDR2, usesDelimiterHeader, usesMemberHeader, 4, EncapsulationKind(kind)) # julia is 1-indexed
     end
 end
 
 function align(r::CDRReader, size::Int)
-    alignment = (r.offset - r.origin) % size
+    alignment = (position(r.src) - r.origin) % size
     if alignment > 0
-        r.offset += size - alignment
+        skip(r.src, size - alignment)
     end
 end
 
@@ -103,9 +104,9 @@ end
 
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Char}
     align(r, sizeof(T))
-    value = reinterpret(T, @view r.buf[r.offset:end])[1]
-    r.offset += sizeof(T)
-    return value
+    r = Ref{T}()
+    check_read(unsafe_read(r.src, r, sizeof(T)), sizeof(T))
+    return r[]
 end
 
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32, Int64, UInt64, Float64}
@@ -115,29 +116,24 @@ function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int3
         align(r, sizeof(T))
     end
 
-    value = reinterpret(T, @view r.buf[r.offset:r.offset+sizeof(T)-1])[1] 
+    r = Ref{T}()
+    check_read(unsafe_read(r.src, r, sizeof(T)), sizeof(T))
     
     if !r.littleEndian
-        value = ntoh(value)
+        return ntoh(r[])
     end
-    
-    r.offset += sizeof(T)
-    return value
+    return r[]
 end
 
 Base.read(r::CDRReader, ::Type{String}) = read(r, String, read(r, UInt32))
 function Base.read(r::CDRReader, ::Type{String}, len::Integer)
     if len <= 1
-        r.offset += len
+        skip(r.src, len)
         return ""
     end
-    if r.buf[r.offset + len - 1] == 0x00 # null terminated
-        value = String(@view r.buf[r.offset:r.offset + len - 2])
-    else 
-        value = String(@view r.buf[r.offset:r.offset + len - 1])
-    end
-    r.offset += len
-    return value
+    res = Vector{UInt8}(undef, len)
+    check_read(unsafe_read(r.src, res, len), len)
+    return string(res)
 end
 
 dHeader(r::CDRReader) = read(r, UInt32)
@@ -246,13 +242,13 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
     end
     align(r, alignment)
     if !r.littleEndian
-        array = copy(reinterpret(T, @view r.buf[r.offset:r.offset + count*sizeof(T) - 1]))
-        r.offset += count * sizeof(T)
+        array = Vector{T}(undef, count)
+        check_read(unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T))
         array .= ntoh.(array)
         return array
-    elseif r.offset % sizeof(T) === 0
-        array = reinterpret(T, @view r.buf[r.offset:r.offset + count*sizeof(T) - 1])
-        r.offset += count * sizeof(T)
+    elseif position(r.src) % sizeof(T) === 0
+        array = Vector{T}(undef, count)
+        check_read(unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T))
         return array
     else
         array = Vector{T}(undef, count)
@@ -265,5 +261,12 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
             r.offset += sizeof(T)
         end
         return array
+    end
+end
+
+
+function check_read(real_bytes, actual_bytes)
+    if real_bytes != actual_bytes
+        throw("EOF when deserializing!")
     end
 end
