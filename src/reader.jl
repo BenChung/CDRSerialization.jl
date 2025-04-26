@@ -52,12 +52,8 @@ mutable struct CDRReader{B <: IO}
     kind::EncapsulationKind
 
     function CDRReader(buf::A) where A <: IO
-        preamble = Ref{Int64}(0)
-        nb = unsafe_read(buf, preamble, 4)
-        if nb != 4
-            throw("Invalid CDR header (buffer too small)")
-        end
-        kind = (preamble >> 24) & 0xFF
+        preamble = ntoh(read(buf, UInt32))
+        kind = UInt8((preamble >> 16) & 0xFF)
         isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(kind)
         new{A}(buf, littleEndian, isCDR2 ? 4 : 8, isCDR2, usesDelimiterHeader, usesMemberHeader, 4, EncapsulationKind(kind)) # julia is 1-indexed
     end
@@ -104,9 +100,7 @@ end
 
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Char}
     align(r, sizeof(T))
-    r = Ref{T}()
-    check_read(unsafe_read(r.src, r, sizeof(T)), sizeof(T))
-    return r[]
+    return read(r.src, T)
 end
 
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32, Int64, UInt64, Float64}
@@ -116,13 +110,12 @@ function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int3
         align(r, sizeof(T))
     end
 
-    r = Ref{T}()
-    check_read(unsafe_read(r.src, r, sizeof(T)), sizeof(T))
+    res = read(r.src, T)
     
     if !r.littleEndian
-        return ntoh(r[])
+        return ntoh(res)
     end
-    return r[]
+    return res
 end
 
 Base.read(r::CDRReader, ::Type{String}) = read(r, String, read(r, UInt32))
@@ -131,9 +124,11 @@ function Base.read(r::CDRReader, ::Type{String}, len::Integer)
         skip(r.src, len)
         return ""
     end
-    res = Vector{UInt8}(undef, len)
-    check_read(unsafe_read(r.src, res, len), len)
-    return string(res)
+    bytes = read(r.src, len)
+    if bytes[end] == 0x00
+        bytes = @view bytes[1:end-1]
+    end
+    return String(bytes)
 end
 
 dHeader(r::CDRReader) = read(r, UInt32)
@@ -243,30 +238,18 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
     align(r, alignment)
     if !r.littleEndian
         array = Vector{T}(undef, count)
-        check_read(unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T))
+        unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T)
         array .= ntoh.(array)
         return array
     elseif position(r.src) % sizeof(T) === 0
         array = Vector{T}(undef, count)
-        check_read(unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T))
+        unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T)
         return array
     else
         array = Vector{T}(undef, count)
         for i=1:count
-            if !r.littleEndian
-                array[i] = ntoh(reinterpret(T, @view r.buf[r.offset:end])[1])
-            else
-                array[i] = reinterpret(T, @view r.buf[r.offset:end])[1]
-            end
-            r.offset += sizeof(T)
+            array[i] = read(r, T)
         end
         return array
-    end
-end
-
-
-function check_read(real_bytes, actual_bytes)
-    if real_bytes != actual_bytes
-        throw("EOF when deserializing!")
     end
 end

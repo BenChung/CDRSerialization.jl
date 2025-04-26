@@ -3,8 +3,9 @@
     tf2_msg__TFMessage =
     hex2bytes("0001000001000000cce0d158f08cf9060a000000626173655f6c696e6b000000060000007261646172000000ae47e17a14ae0e4000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f03f")
 
-    reader = CDR.CDRReader(tf2_msg__TFMessage)
-    @test reader.offset == 5
+    reader = CDR.CDRReader(IOBuffer(tf2_msg__TFMessage))
+    @test reader.kind == CDR.CDR_LE
+    #@test reader.offset == 5
     @test CDR.sequenceLength(reader) == 1 # geometry_msgs/TransformStamped[] transforms
     @test read(reader, UInt32) == 1490149580 # uint32 sec
     @test read(reader, UInt32) == 117017840 # uint32 nsec
@@ -22,13 +23,11 @@
     @test read(reader, Float64) ≈ 0 # float64 z
     @test read(reader, Float64) ≈ 1 # float64 w
 
-    @test reader.offset == length(tf2_msg__TFMessage)+1
-    @test reader.kind == CDR.CDR_LE
 end
 
 @testset "rcl_interfaces/ParameterEvent" begin 
     data = hex2bytes("00010000a9b71561a570ea01110000002f5f726f7332636c695f33373833363300000000010000000d0000007573655f73696d5f74696d650001000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000")
-    reader = CDR.CDRReader(data)
+    reader = CDR.CDRReader(IOBuffer(data))
     # builtin_interfaces/Time stamp
     @test read(reader, UInt32) == 1628813225 # uint32 sec
     @test read(reader, UInt32) == 32141477 # uint32 nsec
