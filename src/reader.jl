@@ -261,18 +261,16 @@ function readStaticArray(r::CDRReader, ::Type{A}, alignment) where {T, D, A<:SAr
         return SArray{Tuple{D}, T}()
     end
     align(r, alignment)
-    #=
     if !r.littleEndian
-        array = Ref{SArray{Tuple{D}, T}}(@SVector zeros(D)) # here
+        array = Ref{SVector{D, T}}(@SVector zeros(D)) # here
         unsafe_read(r.src, array, D*sizeof(T))
         array = ntoh.(array[])
         return array[] # the result is aliased somehow?
     elseif position(r.src) % sizeof(T) === 0
-        array = Ref{SArray{Tuple{D}, T}}(@SVector zeros(D)) # and here
+        array = Ref{SVector{D, T}}(@SVector zeros(D)) # and here
         unsafe_read(r.src, array, D*sizeof(T))
         return array[] # same here
     else
-        =#
-    return SVector{D, T}(read(r, T) for i = 1:D)
-    #end
+        return SVector{D, T}(read(r, T) for i = 1:D)
+    end
 end
