@@ -1,6 +1,6 @@
 function writeExampleMessage(w::CDRWriter)
     # geometry_msgs/TransformStamped[] transforms
-    CDR.sequenceLength(w, 1)
+    CDRSerialization.sequenceLength(w, 1)
     # std_msgs/Header header
     # time stamp
     write(w, UInt32(1490149580)) # uint32 sec
@@ -20,18 +20,18 @@ function writeExampleMessage(w::CDRWriter)
 end
 
 encapsulationkinds=[
-    CDR.CDR2_BE,
-    CDR.CDR2_LE,
-    CDR.PL_CDR2_BE,
-    CDR.PL_CDR2_LE,
-    CDR.DELIMITED_CDR2_BE,
-    CDR.DELIMITED_CDR2_LE,
-    CDR.RTPS_CDR2_BE,
-    CDR.RTPS_CDR2_LE,
-    CDR.RTPS_PL_CDR2_BE,
-    CDR.RTPS_PL_CDR2_LE,
-    CDR.RTPS_DELIMITED_CDR2_BE,
-    CDR.RTPS_DELIMITED_CDR2_LE,
+    CDRSerialization.CDR2_BE,
+    CDRSerialization.CDR2_LE,
+    CDRSerialization.PL_CDR2_BE,
+    CDRSerialization.PL_CDR2_LE,
+    CDRSerialization.DELIMITED_CDR2_BE,
+    CDRSerialization.DELIMITED_CDR2_LE,
+    CDRSerialization.RTPS_CDR2_BE,
+    CDRSerialization.RTPS_CDR2_LE,
+    CDRSerialization.RTPS_PL_CDR2_BE,
+    CDRSerialization.RTPS_PL_CDR2_LE,
+    CDRSerialization.RTPS_DELIMITED_CDR2_BE,
+    CDRSerialization.RTPS_DELIMITED_CDR2_LE,
 ]
 
 tf2_msg__TFMessage =
@@ -39,8 +39,8 @@ tf2_msg__TFMessage =
 msg_without_header = tf2_msg__TFMessage[3:end]
 
 for writer in [
-    CDR.CDRWriter(IOBuffer()),
-    CDR.CDRWriter(IOBuffer(), CDR.CDR_LE)
+    CDRSerialization.CDRWriter(IOBuffer()),
+    CDRSerialization.CDRWriter(IOBuffer(), CDRSerialization.CDR_LE)
 ]
     tf2msg = [hex2bytes("00"); UInt8(writer.kind); msg_without_header]
     writeExampleMessage(writer)

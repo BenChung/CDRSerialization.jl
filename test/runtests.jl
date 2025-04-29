@@ -1,4 +1,4 @@
-using CDR, Test
+using CDRSerialization, Test
 using StaticArrays
 
 @testset "Reader" begin 
@@ -10,9 +10,9 @@ end
 
 @testset "readwrite" begin
     data = IOBuffer()
-    w = CDR.CDRWriter(data)
+    w = CDRSerialization.CDRWriter(data)
     # geometry_msgs/TransformStamped[] transforms
-    CDR.sequenceLength(w, 1)
+    CDRSerialization.sequenceLength(w, 1)
     # std_msgs/Header header
     # time stamp
     write(w, UInt32(1490149580)) # uint32 sec
@@ -34,7 +34,7 @@ end
     write(w, SVector(3.0, 1.0, 0.0))
     write(w, SVector(UInt8(0), UInt8(1), UInt8(2)))
     seekstart(data)
-    r = CDR.CDRReader(data)
+    r = CDRSerialization.CDRReader(data)
     @test read(r, UInt32) == UInt32(1)
     @test read(r, UInt32) == UInt32(1490149580)
     @test read(r, UInt32) == UInt32(117017840)

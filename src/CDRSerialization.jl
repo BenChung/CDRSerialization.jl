@@ -1,4 +1,4 @@
-module CDR
+module CDRSerialization
 
 using StaticArrays
 

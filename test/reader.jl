@@ -3,10 +3,10 @@
     tf2_msg__TFMessage =
     hex2bytes("0001000001000000cce0d158f08cf9060a000000626173655f6c696e6b000000060000007261646172000000ae47e17a14ae0e4000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f03f")
 
-    reader = CDR.CDRReader(IOBuffer(tf2_msg__TFMessage))
-    @test reader.kind == CDR.CDR_LE
+    reader = CDRSerialization.CDRReader(IOBuffer(tf2_msg__TFMessage))
+    @test reader.kind == CDRSerialization.CDR_LE
     #@test reader.offset == 5
-    @test CDR.sequenceLength(reader) == 1 # geometry_msgs/TransformStamped[] transforms
+    @test CDRSerialization.sequenceLength(reader) == 1 # geometry_msgs/TransformStamped[] transforms
     @test read(reader, UInt32) == 1490149580 # uint32 sec
     @test read(reader, UInt32) == 117017840 # uint32 nsec
     @test read(reader, String) == "base_link" # string frame_id
@@ -27,7 +27,7 @@ end
 
 @testset "rcl_interfaces/ParameterEvent" begin 
     data = hex2bytes("00010000a9b71561a570ea01110000002f5f726f7332636c695f33373833363300000000010000000d0000007573655f73696d5f74696d650001000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000")
-    reader = CDR.CDRReader(IOBuffer(data))
+    reader = CDRSerialization.CDRReader(IOBuffer(data))
     # builtin_interfaces/Time stamp
     @test read(reader, UInt32) == 1628813225 # uint32 sec
     @test read(reader, UInt32) == 32141477 # uint32 nsec
@@ -35,7 +35,7 @@ end
     @test read(reader, String) == "/_ros2cli_378363"
 
     # Parameter[] new_parameters
-    @test CDR.sequenceLength(reader) == 1
+    @test CDRSerialization.sequenceLength(reader) == 1
     @test read(reader, String) == "use_sim_time" # string name
     # ParameterValue value
     @test read(reader, UInt8) == 1 # uint8 type
@@ -51,8 +51,8 @@ end
     @test read(reader, Vector{String}) == String[] # string[] string_array_value
 
     # Parameter[] changed_parameters
-    @test CDR.sequenceLength(reader) == 0
+    @test CDRSerialization.sequenceLength(reader) == 0
 
     # Parameter[] deleted_parameters
-    @test CDR.sequenceLength(reader) == 0
+    @test CDRSerialization.sequenceLength(reader) == 0
 end
