@@ -3,6 +3,12 @@ uuid = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
 authors = ["benchung"]
 version = "0.1.0"
 
+[deps]
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+
+[compat]
+StaticArrays = "1.9.13"
+
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 

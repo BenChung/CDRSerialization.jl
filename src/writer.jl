@@ -33,7 +33,7 @@ function align(c::CDRWriter, size)
     end
 end
 
-function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}) 
+function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}) 
     align(c, sizeof(typeof(v)))
     write(c.buf, c.littleEndian ? v : ntoh(v))
 end
@@ -144,12 +144,26 @@ function writeArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
     end
 end
 
-
 function Base.write(w::CDRWriter, a::A, writeLength=false) where A<:AbstractArray{String}
     if writeLength
         sequenceLength(w, length(a))
     end
     for s in a
         write(w, s)
+    end
+end
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, sizeof(T))
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, w.eightByteAlignment)
+function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
+    if writeLength
+        sequenceLength(w, length(a))
+    end
+    if w.littleEndian
+        align(w, alignment)
+        write(w.buf, a)
+    else 
+        for v in a 
+            write(w, ntoh(v))
+        end
     end
 end

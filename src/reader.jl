@@ -98,7 +98,7 @@ function getEncapsulationKind(kind::UInt8)
     return isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader
 end
 
-function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Char}
+function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Char, Bool}
     align(r, sizeof(T))
     return read(r.src, T)
 end
@@ -227,7 +227,7 @@ function emHeaderObjectSize(r::CDRReader, lengthCode)
 end
 
 sequenceLength(r::CDRReader) = read(r, UInt32)
-Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}, A<:AbstractArray{T}} = readArray(r, T, num, sizeof(T))
+Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, A<:AbstractArray{T}} = readArray(r, T, num, sizeof(T))
 Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{UInt64, Int64, Float64}, A<:AbstractArray{T}} = readArray(r, T, num, r.eightByteAlignment)
 Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
 
@@ -238,12 +238,12 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
     align(r, alignment)
     if !r.littleEndian
         array = Vector{T}(undef, count)
-        unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T)
+        unsafe_read(r.src, array, count*sizeof(T))
         array .= ntoh.(array)
         return array
     elseif position(r.src) % sizeof(T) === 0
         array = Vector{T}(undef, count)
-        unsafe_read(r.src, array, count*sizeof(T)), count*sizeof(T)
+        unsafe_read(r.src, array, count*sizeof(T))
         return array
     else
         array = Vector{T}(undef, count)
@@ -252,4 +252,27 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
         end
         return array
     end
+end
+
+Base.read(r::CDRReader, ::Type{A}) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}, D, A<:SArray{Tuple{D}, T}} = readStaticArray(r, A, sizeof(T))
+Base.read(r::CDRReader, ::Type{A}) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = readStaticArray(r, A, r.eightByteAlignment)
+function readStaticArray(r::CDRReader, ::Type{A}, alignment) where {T, D, A<:SArray{Tuple{D}, T}} 
+    if D == 0
+        return SArray{Tuple{D}, T}()
+    end
+    align(r, alignment)
+    #=
+    if !r.littleEndian
+        array = Ref{SArray{Tuple{D}, T}}(@SVector zeros(D)) # here
+        unsafe_read(r.src, array, D*sizeof(T))
+        array = ntoh.(array[])
+        return array[] # the result is aliased somehow?
+    elseif position(r.src) % sizeof(T) === 0
+        array = Ref{SArray{Tuple{D}, T}}(@SVector zeros(D)) # and here
+        unsafe_read(r.src, array, D*sizeof(T))
+        return array[] # same here
+    else
+        =#
+    return SVector{D, T}(read(r, T) for i = 1:D)
+    #end
 end
