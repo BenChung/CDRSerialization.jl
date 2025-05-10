@@ -1,6 +1,7 @@
 # CDRSerialization.jl
 
 A port of Foxglove's [CDR library for Javascript](https://github.com/foxglove/cdr) to Julia.
+
 Implments `CDRReader` and `CDRWriter` which consume an `IO` and implement `read(r::CDRReader, t)` and `write(w::CDRWriter, v)` where `t::Type{T}` or `v::T` and `T` is one of
 
 * Primitives `Int8`, `UInt8`, `Char`, `Bool Int16`, `UInt16`, `Int32`, `UInt32`, `Float32`, `Int64`, `UInt64`, `Float64`, or `String`
