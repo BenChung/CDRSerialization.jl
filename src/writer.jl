@@ -166,4 +166,5 @@ function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) wher
             write(w, ntoh(v))
         end
     end
+    return nothing
 end
