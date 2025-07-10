@@ -152,8 +152,8 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where A<:AbstractArra
         write(w, s)
     end
 end
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, sizeof(T))
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, w.eightByteAlignment)
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, sizeof(T), writeLength)
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, w.eightByteAlignment, writeLength)
 function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
     if writeLength
         sequenceLength(w, length(a))
