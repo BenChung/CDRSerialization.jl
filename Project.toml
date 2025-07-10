@@ -1,7 +1,7 @@
 name = "CDRSerialization"
 uuid = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
 authors = ["benchung"]
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
