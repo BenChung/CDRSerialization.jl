@@ -152,9 +152,11 @@ end
     seekstart(data)
     r = CDRSerialization.CDRReader(data)
     @test !CDRSerialization.isAtEnd(r)
+    @test CDRSerialization.byteLength(r) == 16  # 4 preamble + 3 * UInt32
     skip(r, 4)
     @test read(r, UInt32) == 2
     @test CDRSerialization.decodedBytes(r) == 8
+    @test CDRSerialization.byteLength(r) == 16  # unchanged by reads
     @test read(r, UInt32) == 3
     @test CDRSerialization.isAtEnd(r)
 end

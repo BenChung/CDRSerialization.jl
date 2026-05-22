@@ -72,6 +72,7 @@ Base.seek(r::CDRReader, abs::Integer) = (seek(r.src, abs); r)
 Base.skip(r::CDRReader, n::Integer) = (skip(r.src, n); r)
 isAtEnd(r::CDRReader) = eof(r.src)
 decodedBytes(r::CDRReader) = position(r.src) - 4
+byteLength(r::CDRReader) = position(r.src) + bytesavailable(r.src)
 
 function limit!(r::CDRReader, length::Integer)
     r.src isa IOBuffer || throw("limit! only supported for IOBuffer-backed readers")
