@@ -33,20 +33,22 @@ function align(c::CDRWriter, size)
     end
 end
 
-function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}) 
+function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool})
     align(c, sizeof(typeof(v)))
     write(c.buf, c.littleEndian ? v : ntoh(v))
 end
+
+Base.write(c::CDRWriter, v::Char) = write(c, UInt8(v))
 
 function Base.write(c::CDRWriter, v::Union{Float64, UInt64, Int64}) 
     align(c, c.eightByteAlignment)
     write(c.buf, c.littleEndian ? v : ntoh(v))
 end
 
-function Base.write(c::CDRWriter, v::String, writeLength=true) 
+function Base.write(c::CDRWriter, v::String, writeLength=true)
     if writeLength
         align(c, 4)
-        write(c.buf, UInt32(length(v) + 1))
+        write(c.buf, UInt32(sizeof(v) + 1))
     end
     write(c.buf, v)
     write(c.buf, UInt8('\0'))
@@ -89,6 +91,22 @@ function sentinelHeader(c::CDRWriter)
     end
 end
 
+function getLengthCodeForObjectSize(objectSize)
+    if objectSize == 1
+        return 0
+    elseif objectSize == 2
+        return 1
+    elseif objectSize == 4
+        return 2
+    elseif objectSize == 8
+        return 3
+    end
+    if objectSize > 0xffffffff
+        throw("Object size $objectSize is too large; max value is $(0xffffffff)")
+    end
+    return 4
+end
+
 function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize::Int, lengthCode::Union{Nothing, Int})
     if id > 0x0fffffff
         throw("Member ID $id is too large; max value is $(0x0fffffff)")
@@ -106,7 +124,7 @@ function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize:
 
     if finalLengthCode == 0 || finalLengthCode == 1 ||
         finalLengthCode == 2 || finalLengthCode == 3
-        shouldBeSize = lengthCodeToObjectSizes[lengthCode]
+        shouldBeSize = lengthCodeToObjectSize(finalLengthCode)
         if objectSize != shouldBeSize
             throw("Cannot write a length code $(finalLengthCode) header with an object size not equal to $(shouldBeSize)")
         end
@@ -129,7 +147,7 @@ end
 
 sequenceLength(w::CDRWriter, len) = write(w, UInt32(len))
 Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}, A<:AbstractArray{T}} = writeArray(w, a, sizeof(T), writeLength)
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, A<:AbstractArray{T}} = writeArray(w, a, r.eightByteAlignment, writeLength)
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, A<:AbstractArray{T}} = writeArray(w, a, w.eightByteAlignment, writeLength)
 function writeArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
     if writeLength
         sequenceLength(w, length(a))

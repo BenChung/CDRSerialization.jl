@@ -98,9 +98,13 @@ function getEncapsulationKind(kind::UInt8)
     return isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader
 end
 
-function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Char, Bool}
+function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Bool}
     align(r, sizeof(T))
     return read(r.src, T)
+end
+
+function Base.read(r::CDRReader, ::Type{Char})
+    return Char(read(r, UInt8))
 end
 
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32, Int64, UInt64, Float64}
@@ -141,16 +145,29 @@ function emHeader(r::CDRReader)
     end
 end
 
-resetOrigin(r::CDRReader) = r.origin = r.offset
+resetOrigin(r::CDRReader) = r.origin = position(r.src)
 
 const EXTENDED_PID = 0x3f01
 const SENTINEL_PID = 0x3f02
+
+function lengthCodeToObjectSize(lengthCode)
+    if lengthCode == 0
+        return 1
+    elseif lengthCode == 1
+        return 2
+    elseif lengthCode == 2
+        return 4
+    elseif lengthCode == 3
+        return 8
+    end
+    throw("Invalid length code $lengthCode")
+end
 function memberHeaderV1(r::CDRReader)
     align(r, 4)
     idHeader = read(r, UInt16)
-    mustUnderstandFlag = (idHeader & 0x4000) >> 14 === 1
+    mustUnderstandFlag = (idHeader & 0x4000) >> 14 == 1
     # indicates that the parameter has a implementation-specific interpretation
-    implementationSpecificFlag = (idHeader & 0x8000) >> 15 === 1
+    implementationSpecificFlag = (idHeader & 0x8000) >> 15 == 1
 
     # Allows the specification of large member ID and/or data length values
     # requires the reading in of two uint32's for ID and size
@@ -201,7 +218,7 @@ end
 
 function memberHeaderV2(r::CDRReader)
     header = read(r, UInt32)
-    mustUnderstand = abs((header & 0x80000000) >> 31) === 1
+    mustUnderstand = (header & 0x80000000) >> 31 == 1
     # LC is the value of the Length Code for the member.
     lengthCode = (header & 0x70000000) >> 28
     id = header & 0x0fffffff
@@ -214,7 +231,7 @@ end
 function emHeaderObjectSize(r::CDRReader, lengthCode)
     if lengthCode == 0 || lengthCode == 1 ||
         lengthCode == 2 || lengthCode == 3
-        return lengthCodeToObjectSizes[lengthCode]
+        return lengthCodeToObjectSize(lengthCode)
     elseif lengthCode == 4 || lengthCode == 5
         return read(r, UInt32)
     elseif lengthCode == 6
@@ -222,7 +239,7 @@ function emHeaderObjectSize(r::CDRReader, lengthCode)
     elseif lengthCode == 7
         return read(r, UInt32) * 8
     else 
-        throw("Invalid length code $lengthCode in EMHEADER at offset $(r.offset - 4)")
+        throw("Invalid length code $lengthCode in EMHEADER at offset $(position(r.src) - 4)")
     end
 end
 
