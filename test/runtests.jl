@@ -213,6 +213,48 @@ end
     @test read(r, UInt32) == 42
 end
 
+@testset "uint16BE / uint32BE / uint64BE round-trip on LE stream" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data, CDRSerialization.CDR_LE)
+    CDRSerialization.uint16BE(w, UInt16(0x1234))
+    CDRSerialization.uint32BE(w, UInt32(0xDEADBEEF))
+    CDRSerialization.uint64BE(w, UInt64(0x0102030405060708))
+    # confirm the bytes are big-endian regardless of the stream's LE kind
+    bytes = CDRSerialization.data(w)
+    # After preamble (4 bytes): UInt16 at 5-6, then 2 bytes alignment padding,
+    # UInt32 at 9-12 (already 8-aligned for the UInt64 that follows).
+    @test bytes[5:6] == UInt8[0x12, 0x34]
+    @test bytes[9:12] == UInt8[0xDE, 0xAD, 0xBE, 0xEF]
+    @test bytes[13:20] == UInt8[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test CDRSerialization.uint16BE(r) == 0x1234
+    @test CDRSerialization.uint32BE(r) == 0xDEADBEEF
+    @test CDRSerialization.uint64BE(r) == 0x0102030405060708
+end
+
+@testset "writer data / position accessors" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, UInt32(0xCAFEBABE))
+    @test position(w) == 8  # 4 preamble + 4 UInt32
+    bytes = CDRSerialization.data(w)
+    @test length(bytes) == 8
+    @test bytes[5:8] == UInt8[0xBE, 0xBA, 0xFE, 0xCA]
+    # non-destructive: buffer still has the data
+    @test position(w) == 8
+end
+
+@testset "Vector{String} round-trip" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    arr = ["foo", "barbaz", "héllo"]
+    write(w, arr, true)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, Vector{String}) == arr
+end
+
 @testset "SMatrix round-trip" begin
     data = IOBuffer()
     w = CDRSerialization.CDRWriter(data)

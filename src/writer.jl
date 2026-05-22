@@ -45,6 +45,24 @@ function presentFlag(c::CDRWriter, value::Bool)
     write(c, UInt8(value ? 1 : 0))
 end
 
+function uint16BE(c::CDRWriter, v::UInt16)
+    align(c, 2)
+    write(c.buf, hton(v))
+end
+
+function uint32BE(c::CDRWriter, v::UInt32)
+    align(c, 4)
+    write(c.buf, hton(v))
+end
+
+function uint64BE(c::CDRWriter, v::UInt64)
+    align(c, c.eightByteAlignment)
+    write(c.buf, hton(v))
+end
+
+Base.position(c::CDRWriter) = position(c.buf)
+data(c::CDRWriter) = view(c.buf.data, 1:position(c.buf))
+
 function Base.write(c::CDRWriter, v::Union{Float64, UInt64, Int64}) 
     align(c, c.eightByteAlignment)
     write(c.buf, c.littleEndian ? v : ntoh(v))

@@ -93,6 +93,21 @@ function isPresentFlag(r::CDRReader)
     return read(r, UInt8) != 0
 end
 
+function uint16BE(r::CDRReader)
+    align(r, 2)
+    return ntoh(read(r.src, UInt16))
+end
+
+function uint32BE(r::CDRReader)
+    align(r, 4)
+    return ntoh(read(r.src, UInt32))
+end
+
+function uint64BE(r::CDRReader)
+    align(r, r.eightByteAlignment)
+    return ntoh(read(r.src, UInt64))
+end
+
 function align(r::CDRReader, size::Int)
     alignment = (position(r.src) - r.origin) % size
     if alignment > 0
