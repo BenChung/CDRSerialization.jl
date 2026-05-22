@@ -300,23 +300,18 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
     end
 end
 
-Base.read(r::CDRReader, ::Type{A}) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}, D, A<:SArray{Tuple{D}, T}} = readStaticArray(r, A, sizeof(T))
-Base.read(r::CDRReader, ::Type{A}) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = readStaticArray(r, A, r.eightByteAlignment)
-function readStaticArray(r::CDRReader, ::Type{A}, alignment) where {T, D, A<:SArray{Tuple{D}, T}} 
-    if D == 0
-        return SArray{Tuple{D}, T}()
+Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, S, N, L, SA<:SArray{S, T, N, L}} = readStaticArray(r, SA, sizeof(T))
+Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int64, UInt64, Float64}, S, N, L, SA<:SArray{S, T, N, L}} = readStaticArray(r, SA, r.eightByteAlignment)
+
+function readStaticArray(r::CDRReader, ::Type{SA}, alignment) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+    if L == 0
+        return SA(ntuple(_ -> zero(T), Val(L)))
     end
     align(r, alignment)
+    ref = Ref{NTuple{L, T}}()
+    GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
     if !r.littleEndian
-        array = Ref{SVector{D, T}}(@SVector zeros(D)) # here
-        unsafe_read(r.src, array, D*sizeof(T))
-        array = ntoh.(array[])
-        return array[] # the result is aliased somehow?
-    elseif position(r.src) % sizeof(T) === 0
-        array = Ref{SVector{D, T}}(@SVector zeros(D)) # and here
-        unsafe_read(r.src, array, D*sizeof(T))
-        return array[] # same here
-    else
-        return SVector{D, T}(read(r, T) for i = 1:D)
+        return SA(ntoh.(ref[]))
     end
+    return SA(ref[])
 end

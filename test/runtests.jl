@@ -213,6 +213,41 @@ end
     @test read(r, UInt32) == 42
 end
 
+@testset "SMatrix round-trip" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    m = SMatrix{2, 3, Float64}(1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+    write(w, m)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, SMatrix{2, 3, Float64, 6}) === m
+end
+
+@testset "3-D SArray round-trip" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    a = SArray{Tuple{2, 2, 2}, Int32, 3, 8}(Int32.(1:8))
+    write(w, a)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, SArray{Tuple{2, 2, 2}, Int32, 3, 8}) === a
+end
+
+@testset "SArray read is non-allocating after warmup" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    a = SMatrix{3, 4, Int32}(Int32.(1:12))
+    write(w, a)
+    payload_pos = 4  # right after preamble; payload starts here (sizeof(Int32)==4)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    # warmup
+    read(r, SMatrix{3, 4, Int32, 12})
+    seek(r, payload_pos)
+    allocs = @allocated read(r, SMatrix{3, 4, Int32, 12})
+    @test allocs == 0
+end
+
 @testset "V1 ignore-PID is surfaced (0x3f03)" begin
     raw = UInt8[0x00, 0x01, 0x00, 0x00]
     append!(raw, reinterpret(UInt8, UInt16[0x3f03]))       # ignore-PID, no flags

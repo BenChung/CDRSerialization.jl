@@ -175,17 +175,18 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where A<:AbstractArra
         write(w, s)
     end
 end
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, sizeof(T), writeLength)
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, D, A<:SArray{Tuple{D}, T}} = writeStaticArray(w, a, w.eightByteAlignment, writeLength)
-function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, S, N, L, A<:SArray{S, T, N, L}} = writeStaticArray(w, a, sizeof(T), writeLength)
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T<:Union{Int64, UInt64, Float64}, S, N, L, A<:SArray{S, T, N, L}} = writeStaticArray(w, a, w.eightByteAlignment, writeLength)
+
+function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) where {S, T, N, L, A<:SArray{S, T, N, L}}
     if writeLength
-        sequenceLength(w, length(a))
+        sequenceLength(w, L)
     end
     if w.littleEndian
         align(w, alignment)
         write(w.buf, a)
-    else 
-        for v in a 
+    else
+        for v in a
             write(w, ntoh(v))
         end
     end
