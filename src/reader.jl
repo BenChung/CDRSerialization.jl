@@ -57,6 +57,40 @@ mutable struct CDRReader{B <: IO}
         isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(kind)
         new{A}(buf, littleEndian, isCDR2 ? 4 : 8, isCDR2, usesDelimiterHeader, usesMemberHeader, 4, EncapsulationKind(kind)) # julia is 1-indexed
     end
+
+    function CDRReader{A}(src::A, littleEndian::Bool, eightByteAlignment::Int, isCDR2::Bool,
+                          usesDelimiterHeader::Bool, usesMemberHeader::Bool, origin::Int,
+                          kind::EncapsulationKind) where A <: IO
+        new{A}(src, littleEndian, eightByteAlignment, isCDR2, usesDelimiterHeader,
+               usesMemberHeader, origin, kind)
+    end
+end
+
+Base.eof(r::CDRReader) = eof(r.src)
+Base.position(r::CDRReader) = position(r.src)
+Base.seek(r::CDRReader, abs::Integer) = (seek(r.src, abs); r)
+Base.skip(r::CDRReader, n::Integer) = (skip(r.src, n); r)
+isAtEnd(r::CDRReader) = eof(r.src)
+decodedBytes(r::CDRReader) = position(r.src) - 4
+
+function limit!(r::CDRReader, length::Integer)
+    r.src isa IOBuffer || throw("limit! only supported for IOBuffer-backed readers")
+    r.src.size = position(r.src) + Int(length)
+    return r
+end
+
+function Base.copy(r::CDRReader)
+    r.src isa IOBuffer || throw("copy only supported for IOBuffer-backed readers")
+    newio = IOBuffer(r.src.data; read=true, write=false)
+    newio.size = r.src.size
+    seek(newio, position(r.src))
+    return CDRReader{typeof(newio)}(newio, r.littleEndian, r.eightByteAlignment, r.isCDR2,
+                                     r.usesDelimiterHeader, r.usesMemberHeader, r.origin, r.kind)
+end
+
+function isPresentFlag(r::CDRReader)
+    r.isCDR2 || throw("isPresentFlag is only valid for CDR2 streams")
+    return read(r, UInt8) != 0
 end
 
 function align(r::CDRReader, size::Int)
@@ -181,15 +215,9 @@ function memberHeaderV1(r::CDRReader)
       return (id=SENTINEL_PID, objectSize=0, mustUnderstand=false, readSentinelHeader=true)
     end
 
-    # Indicates that the ID should be ignored
-    # ignorePIDFlag = (idHeader & 0x3fff) === 0x3f03;
-
-    usesReservedParameterId = (idHeader & 0x3fff) > SENTINEL_PID;
-
-    # Not trying to support right now if we don't need to
-    if (usesReservedParameterId || implementationSpecificFlag)
-      throw("Unsupported parameter ID header $(idHeader)")
-    end
+    # Indicates that the parameter ID should be ignored by the consumer,
+    # but the size field still needs to be consumed so we can skip the value.
+    ignorePIDFlag = (idHeader & 0x3fff) == 0x3f03
 
     if (extendedPIDFlag)
       # Need to consume last part of header (is just an 8 in this case)
@@ -197,10 +225,11 @@ function memberHeaderV1(r::CDRReader)
       read(r, UInt16)
     end
 
-    id = extendedPIDFlag ? read(r, UInt32) : idHeader & 0x3fff
-    objectSize = extendedPIDFlag ? read(r, UInt32) : read(r, UInt16)
+    id = extendedPIDFlag ? read(r, UInt32) : UInt32(idHeader & 0x3fff)
+    objectSize = extendedPIDFlag ? read(r, UInt32) : UInt32(read(r, UInt16))
     resetOrigin(r)
-    return (; id, objectSize, mustUnderstand=mustUnderstandFlag)
+    return (; id, objectSize, mustUnderstand=mustUnderstandFlag,
+            implementationSpecific=implementationSpecificFlag, ignore=ignorePIDFlag)
 end
 
 function sentinelHeader(r::CDRReader)

@@ -40,6 +40,11 @@ end
 
 Base.write(c::CDRWriter, v::Char) = write(c, UInt8(v))
 
+function presentFlag(c::CDRWriter, value::Bool)
+    c.isCDR2 || throw("presentFlag is only valid for CDR2 streams")
+    write(c, UInt8(value ? 1 : 0))
+end
+
 function Base.write(c::CDRWriter, v::Union{Float64, UInt64, Int64}) 
     align(c, c.eightByteAlignment)
     write(c.buf, c.littleEndian ? v : ntoh(v))

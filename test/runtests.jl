@@ -112,3 +112,117 @@ end
     @test read(r, Char) == 'z'
 end
 
+@testset "CDRSizeCalculator matches writer output" begin
+    # Build the example message via the writer
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.sequenceLength(w, 1)
+    write(w, UInt32(1490149580))
+    write(w, UInt32(117017840))
+    write(w, "base_link")
+    write(w, "radar")
+    write(w, Float64(3.835))
+    write(w, Float64(0))
+    write(w, Float64(0))
+    write(w, Float64(0))
+    write(w, Float64(0))
+    write(w, Float64(0))
+    write(w, Float64(1))
+
+    # Compute the same size via the calculator
+    calc = CDRSizeCalculator()
+    CDRSerialization.sequenceLength!(calc)
+    CDRSerialization.add!(calc, UInt32)
+    CDRSerialization.add!(calc, UInt32)
+    CDRSerialization.add!(calc, String, sizeof("base_link"))
+    CDRSerialization.add!(calc, String, sizeof("radar"))
+    for _ in 1:7
+        CDRSerialization.add!(calc, Float64)
+    end
+
+    @test position(calc) == position(data)
+end
+
+@testset "reader seek/skip/isAtEnd" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, UInt32(1))
+    write(w, UInt32(2))
+    write(w, UInt32(3))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test !CDRSerialization.isAtEnd(r)
+    skip(r, 4)
+    @test read(r, UInt32) == 2
+    @test CDRSerialization.decodedBytes(r) == 8
+    @test read(r, UInt32) == 3
+    @test CDRSerialization.isAtEnd(r)
+end
+
+@testset "presentFlag round-trip (CDR2)" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data, CDRSerialization.CDR2_LE)
+    CDRSerialization.presentFlag(w, true)
+    CDRSerialization.presentFlag(w, false)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test CDRSerialization.isPresentFlag(r) == true
+    @test CDRSerialization.isPresentFlag(r) == false
+end
+
+@testset "reader clone branches independently" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, UInt32(42))
+    write(w, UInt32(99))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt32) == 42
+    r2 = copy(r)
+    @test read(r, UInt32) == 99
+    @test read(r2, UInt32) == 99
+end
+
+@testset "reader limit truncates remaining bytes" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, UInt32(1))
+    write(w, UInt32(2))
+    write(w, UInt32(3))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    CDRSerialization.limit!(r, 8)
+    @test read(r, UInt32) == 1
+    @test read(r, UInt32) == 2
+    @test CDRSerialization.isAtEnd(r)
+end
+
+@testset "V1 implementationSpecific PID does not throw" begin
+    # Construct CDR_LE buffer with a member header that has bit 15 set,
+    # followed by a 4-byte payload, and verify we can step past it.
+    raw = UInt8[0x00, 0x01, 0x00, 0x00]
+    # idHeader: implementationSpecific=1, mustUnderstand=0, id=1
+    append!(raw, reinterpret(UInt8, UInt16[(UInt16(1) << 15) | UInt16(1)]))
+    append!(raw, reinterpret(UInt8, UInt16[4]))           # objectSize = 4
+    append!(raw, reinterpret(UInt8, UInt32[42]))           # payload
+    r = CDRSerialization.CDRReader(IOBuffer(raw))
+    h = CDRSerialization.memberHeaderV1(r)
+    @test h.implementationSpecific == true
+    @test h.id == 1
+    @test h.objectSize == 4
+    @test read(r, UInt32) == 42
+end
+
+@testset "V1 ignore-PID is surfaced (0x3f03)" begin
+    raw = UInt8[0x00, 0x01, 0x00, 0x00]
+    append!(raw, reinterpret(UInt8, UInt16[0x3f03]))       # ignore-PID, no flags
+    append!(raw, reinterpret(UInt8, UInt16[4]))            # objectSize
+    append!(raw, reinterpret(UInt8, UInt32[0]))            # payload (to be skipped)
+    r = CDRSerialization.CDRReader(IOBuffer(raw))
+    h = CDRSerialization.memberHeaderV1(r)
+    @test h.ignore == true
+    @test h.objectSize == 4
+    skip(r, Int(h.objectSize))
+    @test CDRSerialization.isAtEnd(r)
+end
+
