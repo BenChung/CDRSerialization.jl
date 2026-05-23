@@ -1,0 +1,9 @@
+{
+  "name": "cdrserialization-foxglove-fuzz",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cross-implementation fuzzing harness: @foxglove/cdr writes, CDRSerialization.jl reads.",
+  "dependencies": {
+    "@foxglove/cdr": "^3.5.0"
+  }
+}

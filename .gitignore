@@ -1,0 +1,12 @@
+# Julia
+/Manifest.toml
+/docs/Manifest.toml
+*.cov
+
+# Node (used by tools/foxglove_fuzz)
+node_modules/
+package-lock.json
+
+# Editor
+*.swp
+.DS_Store
