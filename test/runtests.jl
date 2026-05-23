@@ -305,5 +305,9 @@ end
     @test CDRSerialization.isAtEnd(r)
 end
 
+@testset "AllocCheck" begin
+    include("alloc_check.jl")
+end
+
 include("fuzz.jl")
 

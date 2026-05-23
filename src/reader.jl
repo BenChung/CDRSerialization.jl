@@ -38,12 +38,12 @@
     RTPS_PL_CDR2_LE = 0x0b
 end
 
-mutable struct CDRReader{B <: IO}
+# Both `IsCDR2` and `LE` (little-endian) are hoisted into the type so per-kind
+# and per-endian dispatch resolves at compile time — no field loads, no
+# branches in the inner read/write loop.
+mutable struct CDRReader{B <: IO, IsCDR2, LE}
     src::B
 
-    littleEndian::Bool
-    eightByteAlignment::Int
-    isCDR2::Bool
     usesDelimiterHeader::Bool
     usesMemberHeader::Bool
 
@@ -55,16 +55,24 @@ mutable struct CDRReader{B <: IO}
         preamble = ntoh(read(buf, UInt32))
         kind = UInt8((preamble >> 16) & 0xFF)
         isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(kind)
-        new{A}(buf, littleEndian, isCDR2 ? 4 : 8, isCDR2, usesDelimiterHeader, usesMemberHeader, 4, EncapsulationKind(kind)) # julia is 1-indexed
+        new{A, isCDR2, littleEndian}(buf, usesDelimiterHeader, usesMemberHeader, 4, EncapsulationKind(kind))
     end
 
-    function CDRReader{A}(src::A, littleEndian::Bool, eightByteAlignment::Int, isCDR2::Bool,
-                          usesDelimiterHeader::Bool, usesMemberHeader::Bool, origin::Int,
-                          kind::EncapsulationKind) where A <: IO
-        new{A}(src, littleEndian, eightByteAlignment, isCDR2, usesDelimiterHeader,
-               usesMemberHeader, origin, kind)
+    function CDRReader{A, IsCDR2, LE}(src::A,
+                                      usesDelimiterHeader::Bool, usesMemberHeader::Bool, origin::Int,
+                                      kind::EncapsulationKind) where {A <: IO, IsCDR2, LE}
+        new{A, IsCDR2, LE}(src, usesDelimiterHeader, usesMemberHeader, origin, kind)
     end
 end
+
+@inline isCDR2(::CDRReader{<:Any, B}) where B = B
+@inline littleEndian(::CDRReader{<:Any, <:Any, L}) where L = L
+
+# `r.littleEndian` is no longer a field — provide a method so existing
+# external callers continue to compile. `_maybe_swap` is the fast path used
+# internally; it dispatches on the type parameter, no branch at runtime.
+@inline _maybe_swap(::CDRReader{<:Any, <:Any, true},  v) = v
+@inline _maybe_swap(::CDRReader{<:Any, <:Any, false}, v) = sizeof(v) == 1 ? v : ntoh(v)
 
 Base.eof(r::CDRReader) = eof(r.src)
 Base.position(r::CDRReader) = position(r.src)
@@ -80,41 +88,46 @@ function limit!(r::CDRReader, length::Integer)
     return r
 end
 
-function Base.copy(r::CDRReader)
+function Base.copy(r::CDRReader{<:Any, IsCDR2, LE}) where {IsCDR2, LE}
     r.src isa IOBuffer || throw("copy only supported for IOBuffer-backed readers")
     newio = IOBuffer(r.src.data; read=true, write=false)
     newio.size = r.src.size
     seek(newio, position(r.src))
-    return CDRReader{typeof(newio)}(newio, r.littleEndian, r.eightByteAlignment, r.isCDR2,
+    return CDRReader{typeof(newio), IsCDR2, LE}(newio,
                                      r.usesDelimiterHeader, r.usesMemberHeader, r.origin, r.kind)
 end
 
-function isPresentFlag(r::CDRReader)
-    r.isCDR2 || throw("isPresentFlag is only valid for CDR2 streams")
-    return read(r, UInt8) != 0
-end
+isPresentFlag(::CDRReader{<:Any, false}) = throw("isPresentFlag is only valid for CDR2 streams")
+isPresentFlag(r::CDRReader{<:Any, true}) = read(r, UInt8) != 0
 
-function uint16BE(r::CDRReader)
-    align(r, 2)
-    return ntoh(read(r.src, UInt16))
-end
-
-function uint32BE(r::CDRReader)
-    align(r, 4)
-    return ntoh(read(r.src, UInt32))
-end
-
-function uint64BE(r::CDRReader)
-    align(r, r.eightByteAlignment)
-    return ntoh(read(r.src, UInt64))
-end
-
-function align(r::CDRReader, size::Int)
-    alignment = (position(r.src) - r.origin) % size
+@inline function align(r::CDRReader, size::Int)
+    src = r.src
+    # All CDR alignment sizes are powers of two; `& (size-1)` avoids the
+    # `idiv` that `% size` produces with a non-constant size.
+    alignment = (position(src) - r.origin) & (size - 1)
     if alignment > 0
-        skip(r.src, size - alignment)
+        skip(src, size - alignment)
     end
 end
+
+# 8-byte alignment is 4 on CDR2, 8 on CDR1. Dispatching on the type param
+# resolves at compile time — no field load, no branch.
+@inline align8(r::CDRReader{<:Any, true})  = align(r, 4)
+@inline align8(r::CDRReader{<:Any, false}) = align(r, 8)
+
+# Big-endian reads: one parametric method for UInt16/UInt32, one for UInt64.
+function uintBE(r::CDRReader, ::Type{T}) where T <: Union{UInt16, UInt32}
+    align(r, sizeof(T))
+    return ntoh(_read_prim(r.src, T))
+end
+function uintBE(r::CDRReader, ::Type{UInt64})
+    align8(r)
+    return ntoh(_read_prim(r.src, UInt64))
+end
+
+uint16BE(r::CDRReader) = uintBE(r, UInt16)
+uint32BE(r::CDRReader) = uintBE(r, UInt32)
+uint64BE(r::CDRReader) = uintBE(r, UInt64)
 
 function getEncapsulationKind(kind::UInt8)
     isCDR2 = kind > UInt8(PL_CDR_LE)
@@ -148,28 +161,37 @@ function getEncapsulationKind(kind::UInt8)
     return isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader
 end
 
+# Read a primitive value directly out of the buffer's backing memory. Mirrors
+# `_write_prim` on the writer side — one typed `unsafe_load!` instead of
+# `Base.read(::IOBuffer, ::Type{T})`'s peek+skip+Ref dance.
+@inline function _read_prim(buf::IOBuffer, ::Type{T}) where T
+    n = sizeof(T)
+    data = buf.data
+    ptr = buf.ptr
+    v = GC.@preserve data unsafe_load(Ptr{T}(pointer(data, ptr)))
+    buf.ptr = ptr + n
+    return v
+end
+# Generic IO fallback for non-IOBuffer-backed readers.
+@inline _read_prim(src::IO, ::Type{T}) where T = read(src, T)
+
 function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int8, UInt8, Bool}
     align(r, sizeof(T))
-    return read(r.src, T)
+    return _read_prim(r.src, T)
 end
 
 function Base.read(r::CDRReader, ::Type{Char})
     return Char(read(r, UInt8))
 end
 
-function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32, Int64, UInt64, Float64}
-    if sizeof(T) == 8
-        align(r, r.eightByteAlignment)
-    else
-        align(r, sizeof(T))
-    end
+function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32}
+    align(r, sizeof(T))
+    return _maybe_swap(r, _read_prim(r.src, T))
+end
 
-    res = read(r.src, T)
-    
-    if !r.littleEndian
-        return ntoh(res)
-    end
-    return res
+function Base.read(r::CDRReader, ::Type{T}) where T <: Union{Int64, UInt64, Float64}
+    align8(r)
+    return _maybe_swap(r, _read_prim(r.src, T))
 end
 
 Base.read(r::CDRReader, ::Type{String}) = read(r, String, read(r, UInt32))
@@ -187,13 +209,8 @@ end
 
 dHeader(r::CDRReader) = read(r, UInt32)
 
-function emHeader(r::CDRReader)
-    if r.isCDR2
-        memberHeaderV2(r)
-    else
-        memberHeaderV1(r)
-    end
-end
+emHeader(r::CDRReader{<:Any, true})  = memberHeaderV2(r)
+emHeader(r::CDRReader{<:Any, false}) = memberHeaderV1(r)
 
 resetOrigin(r::CDRReader) = r.origin = position(r.src)
 
@@ -228,7 +245,9 @@ function memberHeaderV1(r::CDRReader)
     if sentinelPIDFlag
       # Return that we have read the sentinel header when we expected to read an emHeader.
       # This can happen for absent optional members at the end of a struct.
-      return (id=SENTINEL_PID, objectSize=0, mustUnderstand=false, readSentinelHeader=true)
+      return (id=UInt32(SENTINEL_PID), objectSize=UInt32(0), mustUnderstand=false,
+              implementationSpecific=false, ignore=false,
+              readSentinelHeader=true, lengthCode=UInt32(0))
     end
 
     # Indicates that the parameter ID should be ignored by the consumer,
@@ -245,13 +264,12 @@ function memberHeaderV1(r::CDRReader)
     objectSize = extendedPIDFlag ? read(r, UInt32) : UInt32(read(r, UInt16))
     resetOrigin(r)
     return (; id, objectSize, mustUnderstand=mustUnderstandFlag,
-            implementationSpecific=implementationSpecificFlag, ignore=ignorePIDFlag)
+            implementationSpecific=implementationSpecificFlag, ignore=ignorePIDFlag,
+            readSentinelHeader=false, lengthCode=UInt32(0))
 end
 
-function sentinelHeader(r::CDRReader)
-    if r.isCDR2
-        return
-    end
+sentinelHeader(::CDRReader{<:Any, true}) = nothing
+function sentinelHeader(r::CDRReader{<:Any, false})
     align(r, 4)
     header = read(r, UInt16)
     sentinelPIDFlag = (header & 0x3fff) === SENTINEL_PID
@@ -270,54 +288,180 @@ function memberHeaderV2(r::CDRReader)
 
     objectSize = emHeaderObjectSize(r, lengthCode);
 
-    return (; mustUnderstand, id, objectSize, lengthCode);
+    return (; id, objectSize, mustUnderstand,
+            implementationSpecific=false, ignore=false,
+            readSentinelHeader=false, lengthCode)
 end
 
 function emHeaderObjectSize(r::CDRReader, lengthCode)
     if lengthCode == 0 || lengthCode == 1 ||
         lengthCode == 2 || lengthCode == 3
-        return lengthCodeToObjectSize(lengthCode)
+        return UInt32(lengthCodeToObjectSize(lengthCode))
     elseif lengthCode == 4 || lengthCode == 5
         return read(r, UInt32)
     elseif lengthCode == 6
-        return read(r, UInt32) * 4
+        return read(r, UInt32) * UInt32(4)
     elseif lengthCode == 7
-        return read(r, UInt32) * 8
-    else 
+        return read(r, UInt32) * UInt32(8)
+    else
         throw("Invalid length code $lengthCode in EMHEADER at offset $(position(r.src) - 4)")
     end
 end
 
 sequenceLength(r::CDRReader) = read(r, UInt32)
-Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool}, A<:AbstractArray{T}} = readArray(r, T, num, sizeof(T))
-Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{UInt64, Int64, Float64}, A<:AbstractArray{T}} = readArray(r, T, num, r.eightByteAlignment)
-Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
 
-function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
-    if count == 0
-        return T[]
-    end
-    align(r, alignment)
+# Element-bulk read body — alignment is the caller's responsibility.
+# Split by LE so the byte-swap branch goes away at compile time. For BE the
+# `sizeof(T) == 1` check is also a compile-time constant per specialization.
+@inline function _readArrayBody!(r::CDRReader{<:Any, <:Any, true}, ::Type{T}, count) where T
     array = Vector{T}(undef, count)
     GC.@preserve array unsafe_read(r.src, Ptr{UInt8}(pointer(array)), count * sizeof(T))
-    if !r.littleEndian && sizeof(T) > 1
+    return array
+end
+
+@inline function _readArrayBody!(r::CDRReader{<:Any, <:Any, false}, ::Type{T}, count) where T
+    array = Vector{T}(undef, count)
+    GC.@preserve array unsafe_read(r.src, Ptr{UInt8}(pointer(array)), count * sizeof(T))
+    if sizeof(T) > 1
         array .= ntoh.(array)
     end
     return array
 end
 
-Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, S, N, L, SA<:SArray{S, T, N, L}} = readStaticArray(r, SA, sizeof(T))
-Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int64, UInt64, Float64}, S, N, L, SA<:SArray{S, T, N, L}} = readStaticArray(r, SA, r.eightByteAlignment)
+# 1/2/4-byte element type — alignment from constant `sizeof(T)`.
+function Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, A<:AbstractArray{T}}
+    num == 0 && return T[]
+    align(r, sizeof(T))
+    return _readArrayBody!(r, T, num)
+end
 
-function readStaticArray(r::CDRReader, ::Type{SA}, alignment) where {S, T, N, L, SA<:SArray{S, T, N, L}}
-    if L == 0
-        return SA(ntuple(_ -> zero(T), Val(L)))
-    end
-    align(r, alignment)
+# 8-byte element type — alignment via align8.
+function Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where {T <:Union{Int64, UInt64, Float64}, A<:AbstractArray{T}}
+    num == 0 && return T[]
+    align8(r)
+    return _readArrayBody!(r, T, num)
+end
+
+Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
+
+@inline function _readStaticArrayBody(r::CDRReader{<:Any, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
     ref = Ref{NTuple{L, T}}()
     GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
-    if !r.littleEndian && sizeof(T) > 1
+    return SA(ref[])
+end
+
+@inline function _readStaticArrayBody(r::CDRReader{<:Any, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+    ref = Ref{NTuple{L, T}}()
+    GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
+    if sizeof(T) > 1
         return SA(ntoh.(ref[]))
     end
     return SA(ref[])
+end
+
+function Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, S, N, L, SA<:SArray{S, T, N, L}}
+    L == 0 && return SA(ntuple(_ -> zero(T), Val(L)))
+    align(r, sizeof(T))
+    return _readStaticArrayBody(r, SA)
+end
+
+function Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int64, UInt64, Float64}, S, N, L, SA<:SArray{S, T, N, L}}
+    L == 0 && return SA(ntuple(_ -> zero(T), Val(L)))
+    align8(r)
+    return _readStaticArrayBody(r, SA)
+end
+
+# ---------------------------------------------------------------------------
+# Multi-element read: layout-aware bulk reader, mirror of `write_all!`.
+#
+# `read_all!(r, Tuple{T1, T2, …})` computes each field's byte offset at
+# compile time, pre-aligns the buffer once to the strongest alignment in the
+# schema, and emits direct `unsafe_load!`s inside one `GC.@preserve` block.
+# Returns a `Tuple{T1, T2, …}` of values.
+#
+# Restricted to IOBuffer-backed readers because we pull values straight off
+# `buf.data` — other IO types go through the per-value `read` path.
+# ---------------------------------------------------------------------------
+
+# Endian-swap an NTuple element-wise (used for SArray loads on BE streams).
+@inline _maybe_swap_each(::CDRReader{<:Any, <:Any, true}, nt::NTuple) = nt
+@inline _maybe_swap_each(::CDRReader{<:Any, <:Any, false}, nt::NTuple{L, T}) where {L, T} =
+    sizeof(T) == 1 ? nt : map(ntoh, nt)
+
+function _ra_build_body(types::Vector, isCDR2::Bool)
+    isempty(types) && return :(return ())
+
+    max_align = maximum(_wa_align_for(T, isCDR2) for T in types)
+
+    offsets = Int[]
+    cur = 0
+    for T in types
+        a = _wa_align_for(T, isCDR2)
+        rem = cur % a
+        rem != 0 && (cur += a - rem)
+        push!(offsets, cur)
+        cur += _wa_size_for(T)
+    end
+    total_size = cur
+
+    body = Expr[]
+    push!(body, :(align(r, $max_align)))
+    push!(body, :(src = r.src))
+    push!(body, :(local_ptr = src.ptr))
+    push!(body, :(data = src.data))
+
+    value_syms = Symbol[]
+    load_exprs = Expr[]
+
+    for (i, T) in enumerate(types)
+        off = offsets[i]
+        vsym = Symbol("v", i)
+        push!(value_syms, vsym)
+
+        if T <: SArray
+            ET = T.parameters[2]
+            L  = T.parameters[4]
+            NT = :(NTuple{$L, $ET})
+            push!(load_exprs,
+                  :($vsym = $T(_maybe_swap_each(r,
+                      unsafe_load(Ptr{$NT}(pointer(data, local_ptr + $off)))))))
+        elseif T <: Union{Int8, UInt8, Bool}
+            push!(load_exprs,
+                  :($vsym = unsafe_load(Ptr{$T}(pointer(data, local_ptr + $off)))))
+        elseif T === Char
+            push!(load_exprs,
+                  :($vsym = Char(unsafe_load(Ptr{UInt8}(pointer(data, local_ptr + $off))))))
+        else
+            push!(load_exprs,
+                  :($vsym = _maybe_swap(r,
+                      unsafe_load(Ptr{$T}(pointer(data, local_ptr + $off))))))
+        end
+    end
+
+    push!(body, Expr(:macrocall, GlobalRef(Base.GC, Symbol("@preserve")),
+                     LineNumberNode(0, :read_all!),
+                     :data, Expr(:block, load_exprs...)))
+
+    push!(body, :(src.ptr = local_ptr + $total_size))
+    push!(body, Expr(:return, Expr(:tuple, value_syms...)))
+    return Expr(:block, body...)
+end
+
+"""
+    read_all!(r::CDRReader, ::Type{Tuple{T1, T2, …}}) -> Tuple{T1, T2, …}
+
+Read multiple values from `r` according to the schema declared as a `Tuple{…}`
+type, returning them as a Tuple. The schema determines offsets, alignment,
+and the value types pulled from the buffer. Accepted element types match
+those of [`write_all!`](@ref): primitives (Int8…Float64, Bool, Char) and
+`StaticArrays.SArray` of those.
+
+The work is unrolled at compile time, with a single pre-alignment and direct
+`unsafe_load!`s at constant offsets inside one `GC.@preserve` block. Use this
+to balance a `write_all!(c, …)` on the encode side.
+"""
+@generated function read_all!(r::CDRReader{IOBuffer, IsCDR2, LE},
+                              ::Type{Schema}) where {IsCDR2, LE, Schema <: Tuple}
+    decl = collect(Schema.parameters)
+    return _ra_build_body(decl, IsCDR2)
 end

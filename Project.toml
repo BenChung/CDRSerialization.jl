@@ -1,18 +1,20 @@
 name = "CDRSerialization"
 uuid = "cbcadc0d-0faf-4c71-82b5-fceb8cc36223"
-authors = ["benchung"]
 version = "0.1.2"
+authors = ["benchung"]
 
 [deps]
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 
 [compat]
+AllocCheck = "0.2"
 StaticArrays = "1.9.13"
 julia = "1.11"
 
 [extras]
+AllocCheck = "9b6a8646-10ed-4001-bbdc-1d2f46dfbb1a"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Random", "Test"]
+test = ["AllocCheck", "Random", "Test"]
