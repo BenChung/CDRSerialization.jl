@@ -305,3 +305,5 @@ end
     @test CDRSerialization.isAtEnd(r)
 end
 
+include("fuzz.jl")
+
