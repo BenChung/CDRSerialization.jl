@@ -33,7 +33,12 @@ function align(c::CDRWriter, size)
     end
 end
 
-function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Bool})
+function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Bool})
+    align(c, 1)
+    write(c.buf, v)
+end
+
+function Base.write(c::CDRWriter, v::Union{Int16, UInt16, Int32, UInt32, Float32})
     align(c, sizeof(typeof(v)))
     write(c.buf, c.littleEndian ? v : ntoh(v))
 end
@@ -70,8 +75,7 @@ end
 
 function Base.write(c::CDRWriter, v::String, writeLength=true)
     if writeLength
-        align(c, 4)
-        write(c.buf, UInt32(sizeof(v) + 1))
+        write(c, UInt32(sizeof(v) + 1))
     end
     write(c.buf, v)
     write(c.buf, UInt8('\0'))
@@ -169,18 +173,19 @@ function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize:
 end
 
 sequenceLength(w::CDRWriter, len) = write(w, UInt32(len))
-Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32}, A<:AbstractArray{T}} = writeArray(w, a, sizeof(T), writeLength)
+Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, A<:AbstractArray{T}} = writeArray(w, a, sizeof(T), writeLength)
 Base.write(w::CDRWriter, a::A, writeLength=false) where {T <:Union{UInt64, Int64, Float64}, A<:AbstractArray{T}} = writeArray(w, a, w.eightByteAlignment, writeLength)
 function writeArray(w::CDRWriter, a::A, alignment, writeLength=false) where A
     if writeLength
         sequenceLength(w, length(a))
     end
-    if w.littleEndian
-        align(w, alignment)
+    isempty(a) && return
+    align(w, alignment)
+    if w.littleEndian || sizeof(eltype(a)) == 1
         write(w.buf, a)
-    else 
-        for v in a 
-            write(w, ntoh(v))
+    else
+        for v in a
+            write(w.buf, ntoh(v))
         end
     end
 end
@@ -200,12 +205,13 @@ function writeStaticArray(w::CDRWriter, a::A, alignment, writeLength=false) wher
     if writeLength
         sequenceLength(w, L)
     end
-    if w.littleEndian
-        align(w, alignment)
+    L == 0 && return nothing
+    align(w, alignment)
+    if w.littleEndian || sizeof(T) == 1
         write(w.buf, a)
     else
         for v in a
-            write(w, ntoh(v))
+            write(w.buf, ntoh(v))
         end
     end
     return nothing

@@ -298,22 +298,12 @@ function readArray(r::CDRReader, ::Type{T}, count, alignment) where T
         return T[]
     end
     align(r, alignment)
-    if !r.littleEndian
-        array = Vector{T}(undef, count)
-        unsafe_read(r.src, array, count*sizeof(T))
+    array = Vector{T}(undef, count)
+    GC.@preserve array unsafe_read(r.src, Ptr{UInt8}(pointer(array)), count * sizeof(T))
+    if !r.littleEndian && sizeof(T) > 1
         array .= ntoh.(array)
-        return array
-    elseif position(r.src) % sizeof(T) === 0
-        array = Vector{T}(undef, count)
-        unsafe_read(r.src, array, count*sizeof(T))
-        return array
-    else
-        array = Vector{T}(undef, count)
-        for i=1:count
-            array[i] = read(r, T)
-        end
-        return array
     end
+    return array
 end
 
 Base.read(r::CDRReader, ::Type{SA}) where {T<:Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}, S, N, L, SA<:SArray{S, T, N, L}} = readStaticArray(r, SA, sizeof(T))
@@ -326,7 +316,7 @@ function readStaticArray(r::CDRReader, ::Type{SA}, alignment) where {S, T, N, L,
     align(r, alignment)
     ref = Ref{NTuple{L, T}}()
     GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
-    if !r.littleEndian
+    if !r.littleEndian && sizeof(T) > 1
         return SA(ntoh.(ref[]))
     end
     return SA(ref[])
