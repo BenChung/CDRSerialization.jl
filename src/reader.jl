@@ -344,13 +344,41 @@ end
 
 Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
 
-@inline function _readStaticArrayBody(r::CDRReader{<:Any, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+# Fast path: IOBuffer-backed reader pulls the SArray's tuple straight out of
+# the buffer with a single `unsafe_load`. Avoids the `Ref{NTuple{L,T}}()`
+# pattern below — Julia 1.12 stack-promotes that Ref via escape analysis,
+# but 1.11 doesn't and the Ref heap-allocates (64 bytes/call here).
+@inline function _readStaticArrayBody(r::CDRReader{IOBuffer, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+    src = r.src
+    data = src.data
+    ptr = src.ptr
+    nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
+    src.ptr = ptr + L * sizeof(T)
+    return SA(nt)
+end
+
+@inline function _readStaticArrayBody(r::CDRReader{IOBuffer, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+    src = r.src
+    data = src.data
+    ptr = src.ptr
+    nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
+    src.ptr = ptr + L * sizeof(T)
+    if sizeof(T) > 1
+        return SA(ntoh.(nt))
+    end
+    return SA(nt)
+end
+
+# Fallback for non-IOBuffer IO: have to stage through a Ref{NTuple} since
+# generic `unsafe_read` writes into a destination pointer. May allocate
+# under Julia 1.11; on 1.12+ escape analysis stack-promotes the Ref.
+@inline function _readStaticArrayBody(r::CDRReader{<:IO, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
     ref = Ref{NTuple{L, T}}()
     GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
     return SA(ref[])
 end
 
-@inline function _readStaticArrayBody(r::CDRReader{<:Any, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+@inline function _readStaticArrayBody(r::CDRReader{<:IO, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
     ref = Ref{NTuple{L, T}}()
     GC.@preserve ref unsafe_read(r.src, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
     if sizeof(T) > 1

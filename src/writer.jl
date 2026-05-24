@@ -267,17 +267,39 @@ end
     return nothing
 end
 
-# SArray equivalents: take a Ref to get a stable pointer to the immutable.
+# SArray equivalents. Storing the value directly via `unsafe_store!` of an
+# SArray-typed pointer lets LLVM expand the struct store into a memcpy (or
+# member stores) without staging through a `Ref(a)` — important for
+# Julia 1.11, whose escape analysis would heap-allocate the Ref where 1.12
+# stack-promotes it.
 @inline function _writeStaticArrayBody!(w::CDRWriter{<:Any, true}, a::SArray{S, T, N, L}) where {S, T, N, L}
-    ref = Ref(a)
-    GC.@preserve ref _bulk_copy_into!(w.buf, Ptr{UInt8}(pointer_from_objref(ref)), L * sizeof(T))
+    nb = L * sizeof(T)
+    buf = w.buf
+    Base.ensureroom(buf, nb)
+    data = buf.data
+    ptr = buf.ptr
+    GC.@preserve data unsafe_store!(Ptr{SArray{S, T, N, L}}(pointer(data, ptr)), a)
+    new_ptr = ptr + nb
+    if new_ptr - 1 > buf.size
+        buf.size = new_ptr - 1
+    end
+    buf.ptr = new_ptr
     return nothing
 end
 
 @inline function _writeStaticArrayBody!(w::CDRWriter{<:Any, false}, a::SArray{S, T, N, L}) where {S, T, N, L}
     if sizeof(T) == 1
-        ref = Ref(a)
-        GC.@preserve ref _bulk_copy_into!(w.buf, Ptr{UInt8}(pointer_from_objref(ref)), L)
+        nb = L
+        buf = w.buf
+        Base.ensureroom(buf, nb)
+        data = buf.data
+        ptr = buf.ptr
+        GC.@preserve data unsafe_store!(Ptr{SArray{S, T, N, L}}(pointer(data, ptr)), a)
+        new_ptr = ptr + nb
+        if new_ptr - 1 > buf.size
+            buf.size = new_ptr - 1
+        end
+        buf.ptr = new_ptr
     else
         for v in a
             _write_prim(w.buf, ntoh(v))
@@ -472,7 +494,6 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
     # All store addresses are derived from `base_ptr` + a fully constant
     # offset (`local_ptr - 1 + off`), so LLVM sees them as offsets off a
     # single register-held base.
-    ref_setup = Expr[]
     preserve_syms = Symbol[:data]
     store_exprs = Expr[:(_base = base_ptr + (local_ptr - 1))]
 
@@ -480,13 +501,11 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
         off = offsets[i]
         v = value_expr(i)
         if T <: SArray
-            refsym = Symbol("ref", i)
-            push!(ref_setup, :($refsym = Ref($v)))
-            push!(preserve_syms, refsym)
+            # Direct `unsafe_store!` of the SArray value — LLVM lowers the
+            # struct store to a memcpy/member stores without the `Ref(v)`
+            # indirection (which heap-allocates on Julia 1.11).
             push!(store_exprs,
-                  :(Base.unsafe_copyto!(_base + $off,
-                                        Ptr{UInt8}(pointer_from_objref($refsym)),
-                                        $(_wa_size_for(T)))))
+                  :(unsafe_store!(Ptr{$T}(_base + $off), $v)))
         elseif T <: Union{Int8, UInt8, Bool}
             push!(store_exprs,
                   :(unsafe_store!(Ptr{$T}(_base + $off), $v)))
@@ -499,7 +518,6 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
         end
     end
 
-    append!(body, ref_setup)
     push!(body, Expr(:macrocall, GlobalRef(Base.GC, Symbol("@preserve")),
                      LineNumberNode(0, :write_all!),
                      preserve_syms..., Expr(:block, store_exprs...)))
