@@ -1,6 +1,5 @@
-# Both `IsCDR2` and `LE` (little-endian) are hoisted into the type so per-kind
-# and per-endian dispatch resolves at compile time — no field loads, no
-# branches in the inner write loop.
+# `IsCDR2` and `LE` are type parameters so kind- and endian-specific paths
+# dispatch at compile time.
 mutable struct CDRWriter{IsCDR2, LE}
     buf::IOBuffer
 
@@ -22,8 +21,6 @@ end
 @inline isCDR2(::CDRWriter{B}) where B = B
 @inline littleEndian(::CDRWriter{<:Any, L}) where L = L
 
-# Endianness branch resolved at compile time via the LE type parameter.
-# Single-byte values pass through unchanged regardless of endianness.
 @inline _maybe_swap(::CDRWriter{<:Any, true},  v) = v
 @inline _maybe_swap(::CDRWriter{<:Any, false}, v) = sizeof(v) == 1 ? v : ntoh(v)
 
@@ -31,11 +28,6 @@ function resetOrigin(c::CDRWriter)
     c.origin = position(c.buf)
 end
 
-# Internal: emit `padding` zero bytes at the buffer's current write head.
-# Keeping the byte-loop here (rather than the wider zero store used in the
-# packed `write_all!` path) because callers of this checked variant don't
-# advertise their max alignment to us, so we can't safely write past
-# `padding` bytes.
 @inline function _emit_padding!(buf::IOBuffer, padding)
     Base.ensureroom(buf, padding)
     data = buf.data
@@ -53,10 +45,8 @@ end
     return
 end
 
-# All CDR alignment sizes are powers of two (1/2/4/8), so we use a bitmask
-# instead of `% size` (which would compile to an idiv when `size` isn't a
-# compile-time constant). `@inline` lets LLVM constant-fold the mask at any
-# call site that passes a literal or a constant-propagated `sizeof(T)`.
+# CDR alignment sizes are powers of two; the bitmask form folds when `size`
+# is constant-propagated from a literal or `sizeof(T)`.
 @inline function align(c::CDRWriter, size::Int)
     buf = c.buf
     alignment = (buf.ptr - 1 - c.origin) & (size - 1)
@@ -64,21 +54,12 @@ end
     _emit_padding!(buf, size - alignment)
 end
 
-# 8-byte alignment is 4 on CDR2, 8 on CDR1. With `IsCDR2` lifted into the
-# type, each call site dispatches to the right specialization at compile
-# time — no runtime branch, no field load.
+# 8-byte primitives align to 4 on CDR2, 8 on CDR1.
 @inline align8(c::CDRWriter{true})  = align(c, 4)
 @inline align8(c::CDRWriter{false}) = align(c, 8)
 
-# Write a primitive value directly into the buffer's backing memory.
-#
-# Going through Base.unsafe_write here adds ~30 instructions per call
-# (writable/reinit/append flag checks, room math, byte-copy loop), which
-# dominates for small types. We do the room check ourselves, then a single
-# typed `unsafe_store!` — measured at ~4× faster on Float64.
-#
-# Assumes the buffer was constructed with the writer's defaults
-# (append=false, writable, seekable) — i.e. created by CDRWriter.
+# A typed `unsafe_store!` directly into `buf.data` — bypasses `Base.unsafe_write`'s
+# flag checks and per-byte copy loop.
 @inline function _write_prim(buf::IOBuffer, v::T) where T
     n = sizeof(T)
     Base.ensureroom(buf, n)
@@ -98,9 +79,6 @@ function Base.write(c::CDRWriter, v::Union{Int8, UInt8, Bool})
     _write_prim(c.buf, v)
 end
 
-# Julia specializes parametric methods per concrete `T`, so `sizeof(T)` is a
-# compile-time constant inside each specialization and `align` (which is
-# `@inline`) folds the mask down to a single AND.
 function Base.write(c::CDRWriter, v::T) where T <: Union{Int16, UInt16, Int32, UInt32, Float32}
     align(c, sizeof(T))
     _write_prim(c.buf, _maybe_swap(c, v))
@@ -111,9 +89,6 @@ Base.write(c::CDRWriter, v::Char) = write(c, UInt8(v))
 presentFlag(::CDRWriter{false}, ::Bool) = throw("presentFlag is only valid for CDR2 streams")
 presentFlag(c::CDRWriter{true}, value::Bool) = write(c, UInt8(value ? 1 : 0))
 
-# Big-endian helpers: one method per width-class. UInt16/UInt32 share an
-# alignment-from-sizeof method; UInt64 needs align8 because the alignment
-# depends on the encapsulation kind.
 function uintBE(c::CDRWriter, v::T) where T <: Union{UInt16, UInt32}
     align(c, sizeof(T))
     _write_prim(c.buf, hton(v))
@@ -123,7 +98,6 @@ function uintBE(c::CDRWriter, v::UInt64)
     _write_prim(c.buf, hton(v))
 end
 
-# Width-specific names kept for backward compatibility with existing callers.
 uint16BE(c::CDRWriter, v::UInt16) = uintBE(c, v)
 uint32BE(c::CDRWriter, v::UInt32) = uintBE(c, v)
 uint64BE(c::CDRWriter, v::UInt64) = uintBE(c, v)
@@ -197,11 +171,8 @@ function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize:
     if id > 0x0fffffff
         throw("Member ID $id is too large; max value is $(0x0fffffff)")
     end
-    # EMHEADER = (M_FLAG<<31) + (LC<<28) + M.id
-    # M is the member of a structure
-    # M_FLAG is the value of the Must Understand option for the member
+    # EMHEADER wire layout: M_FLAG<<31 | LC<<28 | id
     mustUnderstandFlag = mustUnderstand ? 1 << 31 : 0
-    # LC is the value of the Length Code for the member.
     finalLengthCode = !isnothing(lengthCode) ? lengthCode : getLengthCodeForObjectSize(objectSize)
 
     header = mustUnderstandFlag | (finalLengthCode << 28) | id
@@ -233,7 +204,6 @@ end
 
 sequenceLength(w::CDRWriter, len) = write(w, UInt32(len))
 
-# Internal: bulk memcpy from src into the buffer at the current write head.
 @inline function _bulk_copy_into!(buf::IOBuffer, src::Ptr{UInt8}, nb::Int)
     Base.ensureroom(buf, nb)
     data = buf.data
@@ -247,15 +217,11 @@ sequenceLength(w::CDRWriter, len) = write(w, UInt32(len))
     return
 end
 
-# LE writer: always bulk copy regardless of element width.
 @inline function _writeArrayBody!(w::CDRWriter{<:Any, true}, a::AbstractArray{T}) where T
     GC.@preserve a _bulk_copy_into!(w.buf, Ptr{UInt8}(pointer(a)), length(a) * sizeof(T))
     return nothing
 end
 
-# BE writer: single-byte stays bulk; multi-byte goes through ntoh per element.
-# `sizeof(T) == 1` is a compile-time constant in each specialization, so only
-# one branch survives codegen.
 @inline function _writeArrayBody!(w::CDRWriter{<:Any, false}, a::AbstractArray{T}) where T
     if sizeof(T) == 1
         GC.@preserve a _bulk_copy_into!(w.buf, Ptr{UInt8}(pointer(a)), length(a))
@@ -267,11 +233,8 @@ end
     return nothing
 end
 
-# SArray equivalents. Storing the value directly via `unsafe_store!` of an
-# SArray-typed pointer lets LLVM expand the struct store into a memcpy (or
-# member stores) without staging through a `Ref(a)` — important for
-# Julia 1.11, whose escape analysis would heap-allocate the Ref where 1.12
-# stack-promotes it.
+# `unsafe_store!` of the SArray value avoids a `Ref(a)` indirection that
+# would heap-allocate under Julia 1.11.
 @inline function _writeStaticArrayBody!(w::CDRWriter{<:Any, true}, a::SArray{S, T, N, L}) where {S, T, N, L}
     nb = L * sizeof(T)
     buf = w.buf
@@ -308,8 +271,6 @@ end
     return nothing
 end
 
-# 1/2/4-byte element types: alignment derives from `sizeof(T)`, which is a
-# constant in each parametric specialization and folds inside `align`.
 function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=false) where T <: Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}
     if writeLength
         sequenceLength(w, length(a))
@@ -329,7 +290,6 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where {T <: Union{Int
     return nothing
 end
 
-# 8-byte element types: alignment depends on encapsulation kind (CDR2→4, CDR1→8).
 function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=false) where T <: Union{Int64, UInt64, Float64}
     if writeLength
         sequenceLength(w, length(a))
@@ -358,19 +318,8 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where A<:AbstractArra
     end
 end
 
-# ---------------------------------------------------------------------------
-# Multi-element write: batched ensureroom + unchecked inner writes.
-#
-# `write(w, v1, v2, vs...)` ensures the buffer has room for the worst-case
-# byte count of all arguments in one shot, then writes each value without
-# the per-call `Base.ensureroom` overhead. The work is unrolled at compile
-# time via `@generated`, so each value lands on its concrete-typed write.
-# ---------------------------------------------------------------------------
-
-# Worst-case byte budget for writing a single value of type T:
-#   primitives:  (sizeof(T) - 1) max padding + sizeof(T) value
-#   8-byte ints: 7 max padding (CDR1) + 8 value = 15
-#   SArrays:     worst alignment for T + L*sizeof(T)
+# Worst-case bytes for one value: (sizeof(T) - 1) max padding + sizeof(T) data.
+# 8-byte primitives cap at 15 (7 padding on CDR1 + 8 data).
 @inline _worst_case_bytes(::Type{T}) where T <: Union{Int8, UInt8, Bool, Char} = 1
 @inline _worst_case_bytes(::Type{T}) where T <: Union{Int16, UInt16, Int32, UInt32, Float32} = 2 * sizeof(T) - 1
 @inline _worst_case_bytes(::Type{T}) where T <: Union{Int64, UInt64, Float64} = 15
@@ -381,8 +330,8 @@ end
     return pad + L * sizeof(T)
 end
 
-# Types accepted by the multi-element / bulk write API. (Strings and
-# Vector{T} are excluded — they have runtime-dependent lengths.)
+# Bounded-byte types accepted by `write_all!`. Strings and `Vector{T}` are
+# excluded — their length isn't known at the type level.
 const _BulkWritable = Union{Int8, UInt8, Bool, Char,
                             Int16, UInt16, Int32, UInt32, Float32,
                             Int64, UInt64, Float64, SArray}
@@ -392,23 +341,11 @@ const _BulkWritable = Union{Int8, UInt8, Bool, Char,
     write_all!(c::CDRWriter, vs...)
     write_all!(c::CDRWriter, ::Type{Tuple{T1, T2, …}}, vs...)
 
-Write multiple values to `c` with the full CDR layout (offsets and padding)
-computed at compile time.
-
-The implementation builds the destination layout from the argument types,
-issues one `ensureroom` covering the worst case, aligns the buffer once to
-the strongest alignment in the workload, then emits direct `unsafe_store!`s
-at each value's pre-computed offset inside a single `GC.@preserve` block.
-This eliminates the per-value `align` / `ensureroom` overhead that a
-sequence of `write(c, v)` calls would pay, and gives LLVM contiguous typed
-stores at constant offsets — which it tends to coalesce.
-
-Accepted element types are primitives (Int8…Float64, Bool, Char) and
-`StaticArrays.SArray` of those. Strings and `Vector{T}` are not accepted
-because their byte budget can't be computed at the type level.
-
-The schema overload takes the type list as a `Tuple{…}` type and asserts
-each value against its declared slot.
+Write multiple values to `c` in a single packed operation, with offsets and
+padding resolved at compile time. Accepted element types are primitives
+(Int8…Float64, Bool, Char) and `StaticArrays.SArray` of those. Strings and
+`Vector{T}` are not accepted because their byte budget isn't known at the
+type level. The schema overload type-asserts each value against its slot.
 
 # Examples
 ```julia
@@ -418,7 +355,7 @@ write_all!(c, Tuple{UInt8, Int16, Float64}, 1, 2, 3.14)
 """
 function write_all! end
 
-# Layout helpers used at generation time. NOT for runtime dispatch.
+# Used at @generated time, not for runtime dispatch.
 function _wa_align_for(::Type{T}, isCDR2::Bool) where T
     T <: Union{Int8, UInt8, Bool, Char}            && return 1
     T <: Union{Int16, UInt16}                      && return 2
@@ -440,8 +377,6 @@ function _wa_size_for(::Type{T}) where T
     error("write_all!: unsupported type $T")
 end
 
-# Build the body of a packed write: ensureroom, pre-align, then direct
-# typed stores at compile-time-known offsets.
 function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
     isempty(types) && return :(return nothing)
 
@@ -459,23 +394,17 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
     total_size = cur
 
     body = Expr[]
-    # One ensureroom that covers worst-case pre-align padding + payload.
     push!(body, :(Base.ensureroom(c.buf, $(total_size + max_align - 1))))
     push!(body, :(buf = c.buf))
     push!(body, :(data = buf.data))
-    # Hoist the Memory's inner data pointer ONCE. LLVM otherwise reloads
-    # `data.ptr` before every typed store because TBAA can't prove our
-    # stores don't alias the Memory's metadata. Caching it as a raw Ptr in a
-    # local lets LLVM hold it in a register across the entire store block.
+    # `pointer(data)` cached once; LLVM otherwise reloads `data.ptr` before
+    # every typed store because TBAA can't rule out aliasing.
     push!(body, :(base_ptr = pointer(data)))
 
-    # Inline alignment: a single `max_align`-sized typed zero store covers
-    # up to `max_align - 1` bytes of padding in one instruction. The bytes
-    # beyond actual padding are at the start of the data region and get
-    # overwritten by subsequent value stores, so a wider zero write is safe
-    # as long as ensureroom gave us at least `max_align` bytes (which it
-    # did: `total_size + max_align - 1 >= max_align` when `total_size >= 1`).
-    # `-offset & (max_align - 1)` is the branchless padding count.
+    # Inline alignment: a single `max_align`-sized zero store covers all
+    # possible padding (0..max_align-1 bytes). Bytes beyond the actual
+    # padding sit at the start of the data region and get overwritten by
+    # the value stores. `-offset & (max_align - 1)` is the branchless padding.
     if max_align == 1
         push!(body, :(local_ptr = buf.ptr))
     else
@@ -491,9 +420,6 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
         end)
     end
 
-    # All store addresses are derived from `base_ptr` + a fully constant
-    # offset (`local_ptr - 1 + off`), so LLVM sees them as offsets off a
-    # single register-held base.
     preserve_syms = Symbol[:data]
     store_exprs = Expr[:(_base = base_ptr + (local_ptr - 1))]
 
@@ -501,9 +427,6 @@ function _wa_build_body(types::Vector, isCDR2::Bool, value_expr::Function)
         off = offsets[i]
         v = value_expr(i)
         if T <: SArray
-            # Direct `unsafe_store!` of the SArray value — LLVM lowers the
-            # struct store to a memcpy/member stores without the `Ref(v)`
-            # indirection (which heap-allocates on Julia 1.11).
             push!(store_exprs,
                   :(unsafe_store!(Ptr{$T}(_base + $off), $v)))
         elseif T <: Union{Int8, UInt8, Bool}

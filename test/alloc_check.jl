@@ -1,20 +1,16 @@
 using AllocCheck
 
-# IOBuffer's ensureroom / _resize! reallocates the backing memory when the
-# buffer needs to grow. Those allocations are amortized O(1) on the write
-# count and unavoidable for a growable buffer — filter them out so the test
-# only flags per-call allocations (Ref{T} boxing, Union-typed returns, …).
+# IOBuffer growth (ensureroom / _resize!) is amortized and unavoidable for a
+# growable buffer; filter it so the test only flags per-call allocations.
 _is_iobuffer_growth(alloc) = any(frame -> begin
     s = string(frame)
     occursin("_resize!", s) || occursin("ensureroom", s) || occursin("_similar_data", s)
 end, alloc.backtrace)
 
-# Wrapper around check_allocs that drops the amortized IOBuffer-growth path
-# so the test focuses on per-call allocations.
 _allocs(f, types) = filter(!_is_iobuffer_growth, check_allocs(f, types))
 
-# Wrappers keep T in dispatch so the checked function stays type-stable
-# without capturing locals into closures.
+# `T` stays in dispatch (vs. a closure capturing a local) so each check_allocs
+# sees a fully concrete signature.
 _read_typed(r, ::Type{T}) where T = read(r, T)
 _write_val(w, v) = write(w, v)
 _read_sarray(r, ::Type{SA}) where SA = read(r, SA)
@@ -42,9 +38,7 @@ const _SARRAY_TYPES = (
     SArray{Tuple{2, 2, 2}, Int32, 3, 8},
 )
 
-# CDRReader/CDRWriter are parameterized on (IsCDR2, LittleEndian) — concrete
-# types per encapsulation kind. We test the default CDR1 + LE variant
-# (false, true), which is what `CDRWriter(buf)` constructs.
+# Concrete types for the default CDR1 + LE encapsulation.
 const _ReaderT = CDRSerialization.CDRReader{IOBuffer, false, true}
 const _WriterT = CDRSerialization.CDRWriter{false, true}
 const _CalcT   = CDRSerialization.CDRSizeCalculator
