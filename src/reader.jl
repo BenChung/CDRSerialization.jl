@@ -324,6 +324,60 @@ end
 
 Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
 
+# Vector of user structs (or any other non-primitive element). Reads the
+# length prefix then constructs N inline values.
+function Base.read(r::CDRReader, ::Type{V}; num=sequenceLength(r)) where {T, V<:AbstractArray{T}}
+    return [read(r, T) for _ in 1:num]
+end
+
+# SArray of non-primitive element (struct or nested SArray): no length
+# prefix on the wire (SArray represents a fixed-length array in CDR IDL).
+# Primitive-element SArrays use more specific methods above.
+function Base.read(r::CDRReader, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+    return SA(ntuple(_ -> read(r, T), Val(L)))
+end
+
+# Read a user struct by walking its declared fields. CDR encodes nested
+# structs inline (no per-struct headers), so each field reads independently.
+@generated function _read_user_struct(r::CDRReader, ::Type{T}) where T
+    if isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0
+        field_exprs = Expr[:(read(r, $(fieldtype(T, i)))) for i in 1:fieldcount(T)]
+        return Expr(:call, T, field_exprs...)
+    end
+    return :(throw(ArgumentError(string("read: unsupported type ", $T))))
+end
+
+# Compact-struct fast path: when Julia's in-memory layout matches CDR
+# encoding (isbits + no trailing pad + matching endianness + CDR1), one
+# `unsafe_load` of the whole struct is bit-equivalent to per-field reads
+# and LLVM lowers it to a single wide SIMD load. The caller guarantees
+# compactness via `_is_compact_struct` before invoking.
+@generated function _read_struct_compact(r::R, ::Type{T}) where {R <: CDRReader{<:IOBuffer}, T}
+    isCDR2 = R.parameters[2]
+    max_align = _wa_align_for(T, isCDR2)
+    sz = sizeof(T)
+    return quote
+        align(r, $max_align)
+        src = r.src
+        data = src.data
+        ptr = src.ptr
+        v = GC.@preserve data unsafe_load(Ptr{$T}(pointer(data, ptr)))
+        src.ptr = ptr + $sz
+        return v
+    end
+end
+
+@generated function _read_value(r::R, ::Type{T}) where {R <: CDRReader, T}
+    isCDR2 = R.parameters[2]
+    LE     = R.parameters[3]
+    if R <: CDRReader{<:IOBuffer} && _is_compact_struct(T, isCDR2, LE)
+        return :(_read_struct_compact(r, T))
+    end
+    return :(_read_user_struct(r, T))
+end
+
+Base.read(r::CDRReader, ::Type{T}) where T = _read_value(r, T)
+
 # IOBuffer fast path: pull the tuple straight out with `unsafe_load`. The
 # `Ref{NTuple}` form below allocates on Julia 1.11 (escape analysis on 1.12+
 # stack-promotes it, but 1.11 doesn't).

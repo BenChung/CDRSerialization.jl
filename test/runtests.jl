@@ -305,6 +305,327 @@ end
     @test CDRSerialization.isAtEnd(r)
 end
 
+@testset "write_all! / read_all! round-trip" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w,
+        UInt8(42), Int16(-3), Float32(2.5), Float64(3.14),
+        SVector{3, Float64}(1.0, 2.0, 3.0))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    got = CDRSerialization.read_all!(r,
+        Tuple{UInt8, Int16, Float32, Float64, SVector{3, Float64}})
+    @test got == (UInt8(42), Int16(-3), Float32(2.5), Float64(3.14),
+                  SVector{3, Float64}(1.0, 2.0, 3.0))
+end
+
+struct _TestPoint
+    x::Float64
+    y::Float64
+    z::Float64
+end
+
+struct _TestQuat
+    x::Float64; y::Float64; z::Float64; w::Float64
+end
+
+struct _TestPose
+    position::_TestPoint
+    orientation::_TestQuat
+end
+
+struct _TestNamedPose
+    name::String
+    pose::_TestPose
+end
+
+@testset "write_all! flattens packed nested structs" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    pose = _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.1, 0.2, 0.3, 0.4))
+    CDRSerialization.write_all!(w, UInt32(42), pose, UInt16(7))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt32) == 42
+    @test read(r, Float64) == 1.0  # position.x
+    @test read(r, Float64) == 2.0  # position.y
+    @test read(r, Float64) == 3.0  # position.z
+    @test read(r, Float64) == 0.1  # orientation.x
+    @test read(r, Float64) == 0.2
+    @test read(r, Float64) == 0.3
+    @test read(r, Float64) == 0.4  # orientation.w
+    @test read(r, UInt16) == 7
+end
+
+@testset "write_all! walks structs containing dynamic fields" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    named = _TestNamedPose("base_link",
+                           _TestPose(_TestPoint(3.835, 0.0, 0.0), _TestQuat(0.0, 0.0, 0.0, 1.0)))
+    CDRSerialization.write_all!(w, named)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, String) == "base_link"
+    @test read(r, Float64) == 3.835
+    @test read(r, Float64) == 0.0
+    @test read(r, Float64) == 0.0
+    @test read(r, Float64) == 0.0
+    @test read(r, Float64) == 0.0
+    @test read(r, Float64) == 0.0
+    @test read(r, Float64) == 1.0
+end
+
+@testset "CDRSizeCalculator walks structs via addValue!" begin
+    pose = _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.1, 0.2, 0.3, 0.4))
+    named = _TestNamedPose("base_link", pose)
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, named)
+
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, named)
+    @test position(calc) == position(data)
+end
+
+@testset "Vector{Struct} round-trip" begin
+    poses = [
+        _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0)),
+        _TestPose(_TestPoint(-4.5, 6.5, 7.25), _TestQuat(0.1, 0.2, 0.3, 0.4)),
+        _TestPose(_TestPoint(0.0, 0.0, 0.0), _TestQuat(1.0, 0.0, 0.0, 0.0)),
+    ]
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, poses)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, Vector{_TestPose}) == poses
+
+    # Verify the size calculator matches.
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, poses)
+    @test position(calc) == position(data)
+end
+
+@testset "Vector{Struct} with dynamic field round-trip" begin
+    items = [
+        _TestNamedPose("left", _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0))),
+        _TestNamedPose("right", _TestPose(_TestPoint(-1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0))),
+    ]
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, items)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, Vector{_TestNamedPose}) == items
+end
+
+@testset "Vector{Struct} inside a struct round-trip" begin
+    # Common ROS pattern: a struct whose body is a length-prefixed sequence
+    # of inner structs (e.g. `tf2_msgs/TFMessage`).
+    poses = [
+        _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0)),
+        _TestPose(_TestPoint(4.0, 5.0, 6.0), _TestQuat(0.7, 0.0, 0.7, 0.0)),
+    ]
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, UInt32(0xDEADBEEF), poses, UInt8(7))
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt32) == 0xDEADBEEF
+    @test read(r, Vector{_TestPose}) == poses
+    @test read(r, UInt8) == 7
+end
+
+# Recursive case: container struct holding a Vector of inner structs that
+# themselves contain a Vector. Exercises the round-trip through every
+# dispatch layer (struct → array → struct → array).
+struct _TestInner
+    label::String
+    samples::Vector{Float64}
+end
+
+struct _TestOuter
+    name::String
+    inners::Vector{_TestInner}
+end
+
+# Default struct `==` falls back to `===` on non-isbits fields; provide
+# structural equality so the round-trip assertions work.
+Base.:(==)(a::_TestInner, b::_TestInner) = a.label == b.label && a.samples == b.samples
+Base.:(==)(a::_TestOuter, b::_TestOuter) = a.name == b.name && a.inners == b.inners
+
+@testset "recursively nested arrays of structs round-trip" begin
+    outer = _TestOuter("frame_0",
+                       [_TestInner("a", [1.0, 2.0, 3.0]),
+                        _TestInner("b", Float64[]),
+                        _TestInner("c", [10.0, 20.0])])
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, outer)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, _TestOuter) == outer
+
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, outer)
+    @test position(calc) == position(data)
+end
+
+# A naturally-non-compact struct (Float64 then UInt8 → 7 trailing pad bytes
+# in Julia, only 9 bytes in standard CDR). @cdr_compact emits two inner
+# storage types — one each for CDR1 (Float64 aligns to 8 → 7 trailing pad)
+# and XCDR2 (Float64 aligns to 4 → 3 trailing pad) — and a public wrapper
+# `_PadCompact{V}` that dispatches on variant.
+@cdr_compact struct _PadCompact
+    x::Float64
+    y::UInt8
+end
+
+@testset "@cdr_compact: CDR1 inner layout + compact path" begin
+    Inner = var"__PadCompact_CDR1"
+    @test sizeof(Inner) == 16
+    @test CDRSerialization._is_compact_struct(Inner, false, true)
+    @test CDRSerialization._struct_cdr_size(Inner, false) == 16
+
+    val = _PadCompact(3.14, 0x42)             # default → CDR1 variant
+    @test val isa _PadCompact{Inner}
+    @test val.x == 3.14
+    @test val.y == 0x42
+
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)     # default CDR_LE → CDR1
+    CDRSerialization.write_all!(w, val)
+    @test position(w) == 4 + 16              # preamble + 16 bytes
+
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    got = read(r, _PadCompact)
+    @test got isa _PadCompact{Inner}
+    @test got.x == 3.14
+    @test got.y == 0x42
+end
+
+@testset "@cdr_compact: CDR2 inner layout + compact path" begin
+    Inner = var"__PadCompact_CDR2"
+    @test sizeof(Inner) == 12                # 8 (Float64-as-2xF32) + 1 + 3 pad
+    @test CDRSerialization._is_compact_struct(Inner, true, true)
+    @test CDRSerialization._struct_cdr_size(Inner, true) == 12
+
+    val = _PadCompact(3.14, 0x42; xcdr2=true)
+    @test val isa _PadCompact{Inner}
+    @test val.x == 3.14                       # transparent via getproperty
+    @test val.y == 0x42
+
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data, CDRSerialization.CDR2_LE)
+    CDRSerialization.write_all!(w, val)
+    @test position(w) == 4 + 12
+
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    got = read(r, _PadCompact)
+    @test got isa _PadCompact{Inner}
+    @test got.x == 3.14
+    @test got.y == 0x42
+end
+
+@cdr_compact struct _PoseCompact
+    position::SVector{3, Float64}
+    orientation::SVector{4, Float64}
+end
+
+@testset "@cdr_compact: SArray of Float64 round-trips under both variants" begin
+    pos  = SVector{3, Float64}(1.0, 2.0, 3.0)
+    quat = SVector{4, Float64}(0.0, 0.0, 0.0, 1.0)
+
+    # CDR1: SArray fields kept as-is; layout naturally compact.
+    val1 = _PoseCompact(pos, quat)
+    @test val1 isa _PoseCompact{var"__PoseCompact_CDR1"}
+    @test val1.position == pos
+    @test val1.orientation == quat
+
+    buf1 = IOBuffer()
+    w1 = CDRSerialization.CDRWriter(buf1)
+    CDRSerialization.write_all!(w1, val1)
+    seekstart(buf1)
+    r1 = CDRSerialization.CDRReader(buf1)
+    got1 = read(r1, _PoseCompact)
+    @test got1.position == pos
+    @test got1.orientation == quat
+
+    # CDR2: SArray fields substituted to SVector{N, Float32} for storage,
+    # transparently reinterpreted back on access.
+    val2 = _PoseCompact(pos, quat; xcdr2=true)
+    @test val2 isa _PoseCompact{var"__PoseCompact_CDR2"}
+    @test val2.position == pos
+    @test val2.orientation == quat
+    inner_pos_storage = getfield(getfield(val2, :inner), :position)
+    @test inner_pos_storage isa SVector{6, Float32}
+
+    buf2 = IOBuffer()
+    w2 = CDRSerialization.CDRWriter(buf2, CDRSerialization.CDR2_LE)
+    CDRSerialization.write_all!(w2, val2)
+    seekstart(buf2)
+    r2 = CDRSerialization.CDRReader(buf2)
+    got2 = read(r2, _PoseCompact)
+    @test got2.position == pos
+    @test got2.orientation == quat
+end
+
+@testset "@cdr_compact: variant mismatch is rejected" begin
+    cdr1_val = _PadCompact(1.0, 0x01)
+    cdr2_val = _PadCompact(1.0, 0x01; xcdr2=true)
+
+    # CDR2 writer can't write the CDR1 wrapper, and vice versa.
+    data = IOBuffer()
+    w_cdr2 = CDRSerialization.CDRWriter(data, CDRSerialization.CDR2_LE)
+    @test_throws ArgumentError CDRSerialization.write_all!(w_cdr2, cdr1_val)
+
+    data2 = IOBuffer()
+    w_cdr1 = CDRSerialization.CDRWriter(data2)
+    @test_throws ArgumentError CDRSerialization.write_all!(w_cdr1, cdr2_val)
+end
+
+@testset "SVector{Struct} round-trip (no length prefix)" begin
+    triplet = SVector(
+        _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0)),
+        _TestPose(_TestPoint(4.0, 5.0, 6.0), _TestQuat(0.7, 0.0, 0.7, 0.0)),
+        _TestPose(_TestPoint(7.0, 8.0, 9.0), _TestQuat(0.0, 1.0, 0.0, 0.0)),
+    )
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, UInt32(99), triplet)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt32) == 99
+    @test read(r, typeof(triplet)) == triplet
+
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, UInt32(99))
+    CDRSerialization.addValue!(calc, triplet)
+    @test position(calc) == position(data)
+end
+
+@testset "write_all! mixed packed / dynamic types" begin
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w,
+        UInt8(7), Int32(-99),                         # packed run
+        "hello world",                                # dynamic
+        Float64(3.14), SVector{2, Int32}(10, 20),     # packed run
+        [1.0, 2.0, 3.0],                              # dynamic
+        UInt16(123))                                  # packed run
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt8)   == 7
+    @test read(r, Int32)   == -99
+    @test read(r, String)  == "hello world"
+    @test read(r, Float64) == 3.14
+    @test read(r, SVector{2, Int32}) == SVector{2, Int32}(10, 20)
+    @test read(r, Vector{Float64}) == [1.0, 2.0, 3.0]
+    @test read(r, UInt16)  == 123
+end
+
 @testset "AllocCheck" begin
     include("alloc_check.jl")
 end

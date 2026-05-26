@@ -100,3 +100,52 @@ _add_calc_str(c, n) = CDRSerialization.add!(c, String, n)
     @test isempty(_allocs(_add_calc_str, (_CalcT, Int)))
     @test isempty(_allocs(CDRSerialization.sequenceLength!, (_CalcT,)))
 end
+
+# Test structs spanning the patterns we care about: pure-primitive,
+# SArray-of-primitive field, and one with a String (forces the dynamic path).
+struct _AllocPoint
+    x::Float64
+    y::Float64
+    z::Float64
+end
+
+struct _AllocPose
+    position::_AllocPoint
+    orientation::SVector{4, Float64}
+end
+
+struct _AllocNamedPose
+    name::String
+    pose::_AllocPose
+end
+
+_write_pose(w, p)        = CDRSerialization.write_all!(w, p)
+_write_named(w, n)       = CDRSerialization.write_all!(w, n)
+_write_pose_vec(w, v)    = CDRSerialization.write_all!(w, v)
+_calc_value(c, v)        = CDRSerialization.addValue!(c, v)
+_read_pose(r)            = read(r, _AllocPose)
+
+@testset "AllocCheck: nested struct writes" begin
+    # Packed nested struct → fully flat unsafe_store chain, no allocations.
+    @test isempty(_allocs(_write_pose, (_WriterT, _AllocPose)))
+
+    # Struct with String field uses the dynamic path. String content itself
+    # gets memcpy'd from the existing String object — the wire format
+    # doesn't allocate a new string.
+    @test isempty(_allocs(_write_named, (_WriterT, _AllocNamedPose)))
+
+    # Vector{Struct}: writes length prefix + N inline structs.
+    @test isempty(_allocs(_write_pose_vec, (_WriterT, Vector{_AllocPose})))
+end
+
+@testset "AllocCheck: compact struct read" begin
+    # AllocPose contains Point + SVector{4, Float64}: layout-compatible
+    # → single `unsafe_load` of the whole struct, no allocations.
+    @test isempty(_allocs(_read_pose, (_ReaderT,)))
+end
+
+@testset "AllocCheck: addValue! on structs" begin
+    @test isempty(_allocs(_calc_value, (_CalcT, _AllocPose)))
+    @test isempty(_allocs(_calc_value, (_CalcT, _AllocNamedPose)))
+    @test isempty(_allocs(_calc_value, (_CalcT, Vector{_AllocPose})))
+end
