@@ -630,5 +630,9 @@ end
     include("alloc_check.jl")
 end
 
+@testset "MemBuf (Memory-backed)" begin
+    include("membuf.jl")
+end
+
 include("fuzz.jl")
 

@@ -64,6 +64,11 @@ mutable struct CDRReader{B <: IO, IsCDR2, LE}
     end
 end
 
+# Read directly from a pre-filled raw byte block — a `Memory{UInt8}` or a
+# `Vector{UInt8}` — with no IOBuffer wrapper. Same wire layout: 4-byte
+# preamble at the start, then payload.
+CDRReader(mem::DenseVector{UInt8}) = CDRReader(MemBuf(mem))
+
 @inline isCDR2(::CDRReader{<:Any, B}) where B = B
 @inline littleEndian(::CDRReader{<:Any, <:Any, L}) where L = L
 
@@ -79,17 +84,24 @@ decodedBytes(r::CDRReader) = position(r.src) - 4
 byteLength(r::CDRReader) = position(r.src) + bytesavailable(r.src)
 
 function limit!(r::CDRReader, length::Integer)
-    r.src isa IOBuffer || throw("limit! only supported for IOBuffer-backed readers")
-    r.src.size = position(r.src) + Int(length)
+    r.src isa _CDRBufLike || throw("limit! only supported for IOBuffer-/MemBuf-backed readers")
+    _buf_size!(r.src, position(r.src) + Int(length))
     return r
 end
 
-function Base.copy(r::CDRReader{<:Any, IsCDR2, LE}) where {IsCDR2, LE}
-    r.src isa IOBuffer || throw("copy only supported for IOBuffer-backed readers")
+function Base.copy(r::CDRReader{IOBuffer, IsCDR2, LE}) where {IsCDR2, LE}
     newio = IOBuffer(r.src.data; read=true, write=false)
     newio.size = r.src.size
     seek(newio, position(r.src))
-    return CDRReader{typeof(newio), IsCDR2, LE}(newio,
+    return CDRReader{IOBuffer, IsCDR2, LE}(newio,
+                                     r.usesDelimiterHeader, r.usesMemberHeader, r.origin, r.kind)
+end
+
+function Base.copy(r::CDRReader{B, IsCDR2, LE}) where {B <: MemBuf, IsCDR2, LE}
+    # MemBuf clones share the underlying storage: branching readers must not
+    # mutate the bytes themselves, only their own cursors.
+    newbuf = MemBuf(r.src.mem, r.src.pos, r.src.written)
+    return CDRReader{B, IsCDR2, LE}(newbuf,
                                      r.usesDelimiterHeader, r.usesMemberHeader, r.origin, r.kind)
 end
 
@@ -154,14 +166,14 @@ function getEncapsulationKind(kind::UInt8)
     return isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader
 end
 
-# Typed `unsafe_load!` directly off `buf.data` — bypasses the peek+skip path
-# in `Base.read(::IOBuffer, ::Type{T})`.
-@inline function _read_prim(buf::IOBuffer, ::Type{T}) where T
+# Typed `unsafe_load!` directly off the backing buffer — bypasses the
+# peek+skip path in `Base.read(::IOBuffer, ::Type{T})`.
+@inline function _read_prim(buf::_CDRBufLike, ::Type{T}) where T
     n = sizeof(T)
-    data = buf.data
-    ptr = buf.ptr
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     v = GC.@preserve data unsafe_load(Ptr{T}(pointer(data, ptr)))
-    buf.ptr = ptr + n
+    _buf_pos!(buf, ptr + n)
     return v
 end
 @inline _read_prim(src::IO, ::Type{T}) where T = read(src, T)
@@ -352,17 +364,17 @@ end
 # `unsafe_load` of the whole struct is bit-equivalent to per-field reads
 # and LLVM lowers it to a single wide SIMD load. The caller guarantees
 # compactness via `_is_compact_struct` before invoking.
-@generated function _read_struct_compact(r::R, ::Type{T}) where {R <: CDRReader{<:IOBuffer}, T}
+@generated function _read_struct_compact(r::R, ::Type{T}) where {R <: CDRReader{<:_CDRBufLike}, T}
     isCDR2 = R.parameters[2]
     max_align = _wa_align_for(T, isCDR2)
     sz = sizeof(T)
     return quote
         align(r, $max_align)
         src = r.src
-        data = src.data
-        ptr = src.ptr
+        data = _buf_data(src)
+        ptr = _buf_pos(src)
         v = GC.@preserve data unsafe_load(Ptr{$T}(pointer(data, ptr)))
-        src.ptr = ptr + $sz
+        _buf_pos!(src, ptr + $sz)
         return v
     end
 end
@@ -370,7 +382,7 @@ end
 @generated function _read_value(r::R, ::Type{T}) where {R <: CDRReader, T}
     isCDR2 = R.parameters[2]
     LE     = R.parameters[3]
-    if R <: CDRReader{<:IOBuffer} && _is_compact_struct(T, isCDR2, LE)
+    if R <: CDRReader{<:_CDRBufLike} && _is_compact_struct(T, isCDR2, LE)
         return :(_read_struct_compact(r, T))
     end
     return :(_read_user_struct(r, T))
@@ -378,24 +390,24 @@ end
 
 Base.read(r::CDRReader, ::Type{T}) where T = _read_value(r, T)
 
-# IOBuffer fast path: pull the tuple straight out with `unsafe_load`. The
+# Raw-buffer fast path: pull the tuple straight out with `unsafe_load`. The
 # `Ref{NTuple}` form below allocates on Julia 1.11 (escape analysis on 1.12+
 # stack-promotes it, but 1.11 doesn't).
-@inline function _readStaticArrayBody(r::CDRReader{IOBuffer, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+@inline function _readStaticArrayBody(r::CDRReader{<:_CDRBufLike, <:Any, true}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
     src = r.src
-    data = src.data
-    ptr = src.ptr
+    data = _buf_data(src)
+    ptr = _buf_pos(src)
     nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
-    src.ptr = ptr + L * sizeof(T)
+    _buf_pos!(src, ptr + L * sizeof(T))
     return SA(nt)
 end
 
-@inline function _readStaticArrayBody(r::CDRReader{IOBuffer, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
+@inline function _readStaticArrayBody(r::CDRReader{<:_CDRBufLike, <:Any, false}, ::Type{SA}) where {S, T, N, L, SA<:SArray{S, T, N, L}}
     src = r.src
-    data = src.data
-    ptr = src.ptr
+    data = _buf_data(src)
+    ptr = _buf_pos(src)
     nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
-    src.ptr = ptr + L * sizeof(T)
+    _buf_pos!(src, ptr + L * sizeof(T))
     if sizeof(T) > 1
         return SA(ntoh.(nt))
     end
@@ -453,8 +465,8 @@ function _ra_build_body(types::Vector, isCDR2::Bool)
     body = Expr[]
     push!(body, :(align(r, $max_align)))
     push!(body, :(src = r.src))
-    push!(body, :(local_ptr = src.ptr))
-    push!(body, :(data = src.data))
+    push!(body, :(local_ptr = _buf_pos(src)))
+    push!(body, :(data = _buf_data(src)))
 
     value_syms = Symbol[]
     load_exprs = Expr[]
@@ -488,7 +500,7 @@ function _ra_build_body(types::Vector, isCDR2::Bool)
                      LineNumberNode(0, :read_all!),
                      :data, Expr(:block, load_exprs...)))
 
-    push!(body, :(src.ptr = local_ptr + $total_size))
+    push!(body, :(_buf_pos!(src, local_ptr + $total_size)))
     push!(body, Expr(:return, Expr(:tuple, value_syms...)))
     return Expr(:block, body...)
 end
@@ -499,9 +511,9 @@ end
 Read a schema's worth of values from `r` in a single packed operation, with
 offsets and padding resolved at compile time. Accepted element types match
 [`write_all!`](@ref): primitives (Int8…Float64, Bool, Char) and
-`StaticArrays.SArray` of those. Only IOBuffer-backed readers are supported.
+`StaticArrays.SArray` of those. Only IOBuffer-/MemBuf-backed readers are supported.
 """
-@generated function read_all!(r::CDRReader{IOBuffer, IsCDR2, LE},
+@generated function read_all!(r::CDRReader{<:_CDRBufLike, IsCDR2, LE},
                               ::Type{Schema}) where {IsCDR2, LE, Schema <: Tuple}
     decl = collect(Schema.parameters)
     return _ra_build_body(decl, IsCDR2)

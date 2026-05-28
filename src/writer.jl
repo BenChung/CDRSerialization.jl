@@ -1,7 +1,9 @@
 # `IsCDR2` and `LE` are type parameters so kind- and endian-specific paths
-# dispatch at compile time.
-mutable struct CDRWriter{IsCDR2, LE}
-    buf::IOBuffer
+# dispatch at compile time. `B` is the backing buffer type (IOBuffer or
+# MemBuf) — kept last so `CDRWriter{IsCDR2}` / `CDRWriter{<:Any, LE}`
+# dispatch elsewhere is unaffected.
+mutable struct CDRWriter{IsCDR2, LE, B <: _CDRBufLike}
+    buf::B
 
     usesDelimiterHeader::Bool
     usesMemberHeader::Bool
@@ -9,14 +11,21 @@ mutable struct CDRWriter{IsCDR2, LE}
     origin::Int
     kind::EncapsulationKind
 
-    function CDRWriter(buf::IOBuffer = IOBuffer(), kind::EncapsulationKind=CDR_LE)
+    function CDRWriter(buf::B = IOBuffer(), kind::EncapsulationKind=CDR_LE) where B <: _CDRBufLike
         isCDR2, littleEndian, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(UInt8(kind))
         write(buf, UInt8(0))
         write(buf, UInt8(kind))
         write(buf, UInt16(0))
-        new{isCDR2, littleEndian}(buf, usesDelimiterHeader, usesMemberHeader, 4, kind)
+        new{isCDR2, littleEndian, B}(buf, usesDelimiterHeader, usesMemberHeader, 4, kind)
     end
 end
+
+# Write into a pre-allocated raw byte block — a `Memory{UInt8}` or a
+# `Vector{UInt8}` — the caller being responsible for sizing it (e.g. via
+# CDRSizeCalculator). The 4-byte preamble is written first, exactly as for
+# an IOBuffer.
+CDRWriter(mem::DenseVector{UInt8}, kind::EncapsulationKind=CDR_LE) =
+    CDRWriter(MemBuf(mem, 1, 0), kind)
 
 @inline isCDR2(::CDRWriter{B}) where B = B
 @inline littleEndian(::CDRWriter{<:Any, L}) where L = L
@@ -28,20 +37,20 @@ function resetOrigin(c::CDRWriter)
     c.origin = position(c.buf)
 end
 
-@inline function _emit_padding!(buf::IOBuffer, padding)
-    Base.ensureroom(buf, padding)
-    data = buf.data
-    base = buf.ptr
+@inline function _emit_padding!(buf::_CDRBufLike, padding)
+    _ensureroom!(buf, padding)
+    data = _buf_data(buf)
+    base = _buf_pos(buf)
     GC.@preserve data begin
         for i in 0:padding-1
             unsafe_store!(pointer(data, base + i), UInt8(0))
         end
     end
     new_ptr = base + padding
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return
 end
 
@@ -49,7 +58,7 @@ end
 # is constant-propagated from a literal or `sizeof(T)`.
 @inline function align(c::CDRWriter, size::Int)
     buf = c.buf
-    alignment = (buf.ptr - 1 - c.origin) & (size - 1)
+    alignment = (_buf_pos(buf) - 1 - c.origin) & (size - 1)
     alignment == 0 && return
     _emit_padding!(buf, size - alignment)
 end
@@ -58,23 +67,23 @@ end
 @inline align8(c::CDRWriter{true})  = align(c, 4)
 @inline align8(c::CDRWriter{false}) = align(c, 8)
 
-# A typed `unsafe_store!` directly into `buf.data` — bypasses `Base.unsafe_write`'s
-# flag checks and per-byte copy loop.
-@inline function _write_prim(buf::IOBuffer, v::T) where T
-    Base.ensureroom(buf, sizeof(T))
+# A typed `unsafe_store!` directly into the backing buffer — bypasses
+# `Base.unsafe_write`'s flag checks and per-byte copy loop.
+@inline function _write_prim(buf::_CDRBufLike, v::T) where T
+    _ensureroom!(buf, sizeof(T))
     _write_prim_unchecked!(buf, v)
 end
 
-@inline function _write_prim_unchecked!(buf::IOBuffer, v::T) where T
+@inline function _write_prim_unchecked!(buf::_CDRBufLike, v::T) where T
     n = sizeof(T)
-    data = buf.data
-    ptr = buf.ptr
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     GC.@preserve data unsafe_store!(Ptr{T}(pointer(data, ptr)), v)
     new_ptr = ptr + n
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return n
 end
 
@@ -107,7 +116,7 @@ uint32BE(c::CDRWriter, v::UInt32) = uintBE(c, v)
 uint64BE(c::CDRWriter, v::UInt64) = uintBE(c, v)
 
 Base.position(c::CDRWriter) = position(c.buf)
-data(c::CDRWriter) = view(c.buf.data, 1:position(c.buf))
+data(c::CDRWriter) = view(_buf_data(c.buf), 1:position(c.buf))
 
 function Base.write(c::CDRWriter, v::T) where T <: Union{Float64, UInt64, Int64}
     align8(c)
@@ -208,16 +217,16 @@ end
 
 sequenceLength(w::CDRWriter, len) = write(w, UInt32(len))
 
-@inline function _bulk_copy_into!(buf::IOBuffer, src::Ptr{UInt8}, nb::Int)
-    Base.ensureroom(buf, nb)
-    data = buf.data
-    ptr = buf.ptr
+@inline function _bulk_copy_into!(buf::_CDRBufLike, src::Ptr{UInt8}, nb::Int)
+    _ensureroom!(buf, nb)
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     GC.@preserve data Base.unsafe_copyto!(pointer(data, ptr), src, nb)
     new_ptr = ptr + nb
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return
 end
 
@@ -242,15 +251,15 @@ end
 @inline function _writeStaticArrayBody!(w::CDRWriter{<:Any, true}, a::SArray{S, T, N, L}) where {S, T, N, L}
     nb = L * sizeof(T)
     buf = w.buf
-    Base.ensureroom(buf, nb)
-    data = buf.data
-    ptr = buf.ptr
+    _ensureroom!(buf, nb)
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     GC.@preserve data unsafe_store!(Ptr{SArray{S, T, N, L}}(pointer(data, ptr)), a)
     new_ptr = ptr + nb
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return nothing
 end
 
@@ -258,15 +267,15 @@ end
     if sizeof(T) == 1
         nb = L
         buf = w.buf
-        Base.ensureroom(buf, nb)
-        data = buf.data
-        ptr = buf.ptr
+        _ensureroom!(buf, nb)
+        data = _buf_data(buf)
+        ptr = _buf_pos(buf)
         GC.@preserve data unsafe_store!(Ptr{SArray{S, T, N, L}}(pointer(data, ptr)), a)
         new_ptr = ptr + nb
-        if new_ptr - 1 > buf.size
-            buf.size = new_ptr - 1
+        if new_ptr - 1 > _buf_size(buf)
+            _buf_size!(buf, new_ptr - 1)
         end
-        buf.ptr = new_ptr
+        _buf_pos!(buf, new_ptr)
     else
         for v in a
             _write_prim(w.buf, ntoh(v))
@@ -328,21 +337,21 @@ end
 
 @inline function _align_unchecked!(c::CDRWriter, size::Int)
     buf = c.buf
-    alignment = (buf.ptr - 1 - c.origin) & (size - 1)
+    alignment = (_buf_pos(buf) - 1 - c.origin) & (size - 1)
     alignment == 0 && return
     padding = size - alignment
-    data = buf.data
-    base = buf.ptr
+    data = _buf_data(buf)
+    base = _buf_pos(buf)
     GC.@preserve data begin
         for i in 0:padding-1
             unsafe_store!(pointer(data, base + i), UInt8(0))
         end
     end
     new_ptr = base + padding
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return
 end
 
@@ -354,16 +363,16 @@ end
     _align_unchecked!(c, 4)
     _write_prim_unchecked!(buf, _maybe_swap(c, UInt32(sizeof(s) + 1)))
     n = sizeof(s)
-    data = buf.data
-    ptr = buf.ptr
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     GC.@preserve s data Base.unsafe_copyto!(pointer(data, ptr), pointer(s), n)
     new_ptr = ptr + n
     GC.@preserve data unsafe_store!(pointer(data, new_ptr), UInt8(0))
     new_ptr += 1
-    if new_ptr - 1 > buf.size
-        buf.size = new_ptr - 1
+    if new_ptr - 1 > _buf_size(buf)
+        _buf_size!(buf, new_ptr - 1)
     end
-    buf.ptr = new_ptr
+    _buf_pos!(buf, new_ptr)
     return nothing
 end
 
@@ -374,15 +383,15 @@ end
     isempty(a) && return nothing
     _align_unchecked!(c, sizeof(T))
     nb = length(a) * sizeof(T)
-    data = buf.data
-    ptr = buf.ptr
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     if littleEndian(c) || sizeof(T) == 1
         GC.@preserve a data Base.unsafe_copyto!(pointer(data, ptr), Ptr{UInt8}(pointer(a)), nb)
         new_ptr = ptr + nb
-        if new_ptr - 1 > buf.size
-            buf.size = new_ptr - 1
+        if new_ptr - 1 > _buf_size(buf)
+            _buf_size!(buf, new_ptr - 1)
         end
-        buf.ptr = new_ptr
+        _buf_pos!(buf, new_ptr)
     else
         for v in a
             _write_prim_unchecked!(buf, ntoh(v))
@@ -398,15 +407,15 @@ end
     isempty(a) && return nothing
     _align8_unchecked!(c)
     nb = length(a) * sizeof(T)
-    data = buf.data
-    ptr = buf.ptr
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
     if littleEndian(c)
         GC.@preserve a data Base.unsafe_copyto!(pointer(data, ptr), Ptr{UInt8}(pointer(a)), nb)
         new_ptr = ptr + nb
-        if new_ptr - 1 > buf.size
-            buf.size = new_ptr - 1
+        if new_ptr - 1 > _buf_size(buf)
+            _buf_size!(buf, new_ptr - 1)
         end
-        buf.ptr = new_ptr
+        _buf_pos!(buf, new_ptr)
     else
         for v in a
             _write_prim_unchecked!(buf, ntoh(v))
@@ -518,7 +527,7 @@ function _wa_packed_run_expr(types::Vector, value_exprs::Vector, isCDR2::Bool, L
 
     stmts = Expr[]
     push!(stmts, :(buf = c.buf))
-    push!(stmts, :(data = buf.data))
+    push!(stmts, :(data = _buf_data(buf)))
     # `pointer(data)` cached once; LLVM otherwise reloads `data.ptr` before
     # every typed store because TBAA can't rule out aliasing.
     push!(stmts, :(base_ptr = pointer(data)))
@@ -528,13 +537,13 @@ function _wa_packed_run_expr(types::Vector, value_exprs::Vector, isCDR2::Bool, L
     # region and are overwritten by the value stores.
     # `-offset & (max_align - 1)` is the branchless padding count.
     if max_align == 1
-        push!(stmts, :(local_ptr = buf.ptr))
+        push!(stmts, :(local_ptr = _buf_pos(buf)))
     else
         zero_t = max_align == 2 ? UInt16 :
                  max_align == 4 ? UInt32 :
                                   UInt64
         push!(stmts, quote
-            _old_ptr = buf.ptr
+            _old_ptr = _buf_pos(buf)
             _pad = (-((_old_ptr - 1 - c.origin) & $(max_align - 1))) & $(max_align - 1)
             GC.@preserve data unsafe_store!(Ptr{$zero_t}(base_ptr + (_old_ptr - 1)),
                                             $zero_t(0))
@@ -565,8 +574,8 @@ function _wa_packed_run_expr(types::Vector, value_exprs::Vector, isCDR2::Bool, L
                      :data, Expr(:block, store_exprs...)))
 
     push!(stmts, :(new_ptr = local_ptr + $total_size))
-    push!(stmts, :(new_ptr - 1 > buf.size && (buf.size = new_ptr - 1)))
-    push!(stmts, :(buf.ptr = new_ptr))
+    push!(stmts, :(new_ptr - 1 > _buf_size(buf) && _buf_size!(buf, new_ptr - 1)))
+    push!(stmts, :(_buf_pos!(buf, new_ptr)))
 
     return Expr(:let, Expr(:block), Expr(:block, stmts...))
 end
@@ -703,7 +712,7 @@ function _wa_mixed_body(types::Vector, isCDR2::Bool, LE::Bool, value_expr::Funct
     total = length(size_terms) == 0 ? :(0) :
             length(size_terms) == 1 ? size_terms[1] :
             Expr(:call, :+, size_terms...)
-    push!(body, :(Base.ensureroom(c.buf, $total)))
+    push!(body, :(_ensureroom!(c.buf, $total)))
 
     i = 1
     while i <= n

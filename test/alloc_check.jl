@@ -40,7 +40,7 @@ const _SARRAY_TYPES = (
 
 # Concrete types for the default CDR1 + LE encapsulation.
 const _ReaderT = CDRSerialization.CDRReader{IOBuffer, false, true}
-const _WriterT = CDRSerialization.CDRWriter{false, true}
+const _WriterT = CDRSerialization.CDRWriter{false, true, IOBuffer}
 const _CalcT   = CDRSerialization.CDRSizeCalculator
 
 @testset "AllocCheck: CDRReader primitives" begin

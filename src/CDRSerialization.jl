@@ -2,6 +2,7 @@ module CDRSerialization
 
 using StaticArrays
 
+include("membuf.jl")
 include("layout.jl")
 include("reader.jl")
 include("writer.jl")
