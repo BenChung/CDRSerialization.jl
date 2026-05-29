@@ -606,6 +606,18 @@ end
     @test position(calc) == position(data)
 end
 
+@testset "write_all! with a Vector{String} field/arg" begin
+    # Regression: the byte-budget for a string sequence once used a closure,
+    # which made the @generated write_all! body non-pure.
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, UInt32(3), ["foo", "barbaz", "héllo"])
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt32) == 3
+    @test read(r, Vector{String}) == ["foo", "barbaz", "héllo"]
+end
+
 @testset "write_all! mixed packed / dynamic types" begin
     data = IOBuffer()
     w = CDRSerialization.CDRWriter(data)
@@ -632,6 +644,10 @@ end
 
 @testset "MemBuf (Memory-backed)" begin
     include("membuf.jl")
+end
+
+@testset "reinterpret_struct (zero-copy load)" begin
+    include("reinterpret.jl")
 end
 
 include("fuzz.jl")

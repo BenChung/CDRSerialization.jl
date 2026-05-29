@@ -222,13 +222,22 @@ macro cdr_compact(structdef)
     end
     isempty(f_names) && error("@cdr_compact: struct has no fields")
 
+    # Opt-in view mode: if any field is declared `CDRString` or
+    # `CDRArray{Element}`, emit a buffer-backed view struct read zero-copy.
+    # Plain fields are never silently turned into views.
+    if _cdr_has_view_fields(f_type_exprs)
+        return _cdr_view_emit(name_sym, f_names, f_type_exprs)
+    end
+
     f_types = Type[Base.eval(__module__, te) for te in f_type_exprs]
 
     for T in f_types
         ok = T <: _PrimitivePacked ||
              (T <: SArray && T.parameters[2] <: _PrimitivePacked)
         ok || error("@cdr_compact: field type $T is not compact-eligible " *
-                    "(must be a primitive or an SArray of primitive)")
+                    "(must be a primitive or an SArray of primitive). " *
+                    "For a variable-length field, declare it `CDRArray{Element}` " *
+                    "or `CDRString` to opt into a zero-copy view.")
     end
 
     inner1 = Symbol("_", name_sym, "_CDR1")

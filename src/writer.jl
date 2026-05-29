@@ -612,7 +612,15 @@ function _wa_value_bytes_expr(::Type{T}, isCDR2::Bool, LE::Bool, val_expr) where
     end
 
     if T <: AbstractArray{String}
-        return :(7 + sum(s -> sizeof(s) + 8, $val_expr; init=0))
+        # A for-loop, not `sum(s -> …)`: a closure in a @generated body is
+        # rejected as non-pure.
+        return quote
+            local _sbytes = 7
+            for _s in $val_expr
+                _sbytes += sizeof(_s) + 8
+            end
+            _sbytes
+        end
     end
 
     if T <: AbstractArray
