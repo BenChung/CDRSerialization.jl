@@ -84,7 +84,7 @@ decodedBytes(r::CDRReader) = position(r.src) - 4
 byteLength(r::CDRReader) = position(r.src) + bytesavailable(r.src)
 
 function limit!(r::CDRReader, length::Integer)
-    r.src isa _CDRBufLike || throw("limit! only supported for IOBuffer-/MemBuf-backed readers")
+    r.src isa _CDRBufLike || throw(ArgumentError("limit! only supported for IOBuffer-/MemBuf-backed readers"))
     _buf_size!(r.src, position(r.src) + Int(length))
     return r
 end
@@ -105,7 +105,7 @@ function Base.copy(r::CDRReader{B, IsCDR2, LE}) where {B <: MemBuf, IsCDR2, LE}
                                      r.usesDelimiterHeader, r.usesMemberHeader, r.origin, r.kind)
 end
 
-isPresentFlag(::CDRReader{<:Any, false}) = throw("isPresentFlag is only valid for CDR2 streams")
+isPresentFlag(::CDRReader{<:Any, false}) = throw(ArgumentError("isPresentFlag is only valid for CDR2 streams"))
 isPresentFlag(r::CDRReader{<:Any, true}) = read(r, UInt8) != 0
 
 # CDR alignment sizes are powers of two; the bitmask form avoids an `idiv`.
@@ -230,7 +230,7 @@ function lengthCodeToObjectSize(lengthCode)
     elseif lengthCode == 3
         return 8
     end
-    throw("Invalid length code $lengthCode")
+    error("Invalid length code $lengthCode")
 end
 function memberHeaderV1(r::CDRReader)
     align(r, 4)
@@ -271,7 +271,7 @@ function sentinelHeader(r::CDRReader{<:Any, false})
     header = read(r, UInt16)
     sentinelPIDFlag = (header & 0x3fff) === SENTINEL_PID
     if !sentinelPIDFlag
-        throw("Expected SENTINEL_PID flag but got $header")
+        error("Expected SENTINEL_PID flag but got $header")
     end
     read(r, UInt16)
 end
@@ -300,7 +300,7 @@ function emHeaderObjectSize(r::CDRReader, lengthCode)
     elseif lengthCode == 7
         return read(r, UInt32) * UInt32(8)
     else
-        throw("Invalid length code $lengthCode in EMHEADER at offset $(position(r.src) - 4)")
+        error("Invalid length code $lengthCode in EMHEADER at offset $(position(r.src) - 4)")
     end
 end
 

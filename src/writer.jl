@@ -99,7 +99,7 @@ end
 
 Base.write(c::CDRWriter, v::Char) = write(c, UInt8(v))
 
-presentFlag(::CDRWriter{false}, ::Bool) = throw("presentFlag is only valid for CDR2 streams")
+presentFlag(::CDRWriter{false}, ::Bool) = throw(ArgumentError("presentFlag is only valid for CDR2 streams"))
 presentFlag(c::CDRWriter{true}, value::Bool) = write(c, UInt8(value ? 1 : 0))
 
 function uintBE(c::CDRWriter, v::T) where T <: Union{UInt16, UInt32}
@@ -175,14 +175,14 @@ function getLengthCodeForObjectSize(objectSize)
         return 3
     end
     if objectSize > 0xffffffff
-        throw("Object size $objectSize is too large; max value is $(0xffffffff)")
+        throw(ArgumentError("Object size $objectSize is too large; max value is $(0xffffffff)"))
     end
     return 4
 end
 
 function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize::Int, lengthCode::Union{Nothing, Int})
     if id > 0x0fffffff
-        throw("Member ID $id is too large; max value is $(0x0fffffff)")
+        throw(ArgumentError("Member ID $id is too large; max value is $(0x0fffffff)"))
     end
     # EMHEADER wire layout: M_FLAG<<31 | LC<<28 | id
     mustUnderstandFlag = mustUnderstand ? 1 << 31 : 0
@@ -196,22 +196,22 @@ function memberHeaderV2(c::CDRWriter, mustUnderstand::Bool, id::Int, objectSize:
         finalLengthCode == 2 || finalLengthCode == 3
         shouldBeSize = lengthCodeToObjectSize(finalLengthCode)
         if objectSize != shouldBeSize
-            throw("Cannot write a length code $(finalLengthCode) header with an object size not equal to $(shouldBeSize)")
+            throw(ArgumentError("Cannot write a length code $(finalLengthCode) header with an object size not equal to $(shouldBeSize)"))
         end
     elseif finalLengthCode == 4 || finalLengthCode == 5
         return write(c, UInt32(objectSize))
     elseif finalLengthCode == 6
         if objectSize % 4 !== 0
-            throw("Cannot write a length code 6 header with an object size that is not a multiple of 4")
+            throw(ArgumentError("Cannot write a length code 6 header with an object size that is not a multiple of 4"))
         end
         return write(c, UInt32(objectSize >> 2))
     elseif finalLengthCode == 7
         if objectSize % 8 !== 0
-            throw("Cannot write a length code 7 header with an object size that is not a multiple of 4")
+            throw(ArgumentError("Cannot write a length code 7 header with an object size that is not a multiple of 8"))
         end
         return write(c, UInt32(objectSize >> 3))
     else 
-        throw("Unexpected length code $finalLengthCode")
+        error("Unexpected length code $finalLengthCode")
     end
 end
 
