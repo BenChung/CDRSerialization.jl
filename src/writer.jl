@@ -552,6 +552,26 @@ function _wa_packed_run_expr(types::Vector, value_exprs::Vector, isCDR2::Bool, L
     end
 
     store_exprs = Expr[:(_base = base_ptr + (local_ptr - 1))]
+
+    # Zero inter-element alignment padding: bytes inside the run that no value
+    # store covers. The leading-pad zero-store above only covers the dynamic
+    # run-start padding, not gaps between fields (e.g. the 3 bytes between a
+    # `UInt8` at offset 8 and a `UInt32` at offset 12). Left unzeroed these
+    # carry whatever the buffer held — diverging from standard CDR (which zeros
+    # pad) and leaking uninitialized heap memory onto the wire. This matches the
+    # per-field path's `_emit_padding!`/`_align_unchecked!`, which zero pad.
+    covered = falses(total_size)
+    for (i, T) in enumerate(types)
+        sz = _wa_size_for(T)
+        for b in offsets[i]:(offsets[i] + sz - 1)
+            covered[b + 1] = true
+        end
+    end
+    for g in 0:(total_size - 1)
+        covered[g + 1] && continue
+        push!(store_exprs, :(unsafe_store!(Ptr{UInt8}(_base + $g), 0x00)))
+    end
+
     for (i, T) in enumerate(types)
         off = offsets[i]
         v = value_exprs[i]

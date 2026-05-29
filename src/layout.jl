@@ -157,25 +157,164 @@ function _cdr_compact_layout(types::Vector{<:Type}, isCDR2::Bool)
     return (total, julia_size, max_align)
 end
 
+# Parse the `struct …` definition shared by `@cdr1_compat`/`@cdr_compact` into
+# `(name_sym, field_names, field_type_exprs)`. Rejects mutable structs and any
+# member that isn't a plain `field::Type` declaration. `macroname` is woven
+# into the error messages.
+function _cdr_parse_structdef(structdef, macroname::AbstractString)
+    structdef isa Expr && structdef.head === :struct ||
+        error("$macroname: expected `struct …` definition")
+    structdef.args[1] && error("$macroname: mutable structs are not supported")
+    name_part = structdef.args[2]
+    body      = structdef.args[3]
+
+    name_sym = name_part isa Symbol ? name_part :
+               name_part isa Expr && name_part.head === :curly ? name_part.args[1] :
+               name_part isa Expr && name_part.head === :(<:) ? name_part.args[1] :
+               error("$macroname: unsupported struct name form: $name_part")
+
+    f_names = Symbol[]
+    f_type_exprs = Any[]
+    for ex in body.args
+        ex isa LineNumberNode && continue
+        ex isa Expr && ex.head === :(::) && length(ex.args) == 2 ||
+            error("$macroname: only `field::Type` declarations are supported (got $ex)")
+        push!(f_names, ex.args[1])
+        push!(f_type_exprs, ex.args[2])
+    end
+    isempty(f_names) && error("$macroname: struct has no fields")
+    return name_sym, f_names, f_type_exprs
+end
+
+# True when `T` lays out identically in Julia memory and on the CDR1 wire,
+# field for field — a primitive, an SArray of primitives, or an isbits struct
+# built (transitively) from those. Such a type round-trips through the normal
+# `write_all!`/`read` paths as standard CDR1, with no trailing pad on the wire:
+# the leaf flattener (`_expand_schema!`) recomputes CDR offsets, and a struct
+# that happens to end on its max alignment additionally qualifies for the
+# single-store fast path. Variable-length fields (String/Vector/CDRArray/
+# CDRString) and abstract/non-isbits fields are rejected — they aren't flat.
+function _is_cdr1_compat_type(::Type{T}) where T
+    T <: _PrimitivePacked && return true
+    if T <: SArray
+        return T.parameters[2] <: _PrimitivePacked
+    end
+    if isstructtype(T) && isconcretetype(T) && isbitstype(T) && fieldcount(T) > 0
+        return all(_is_cdr1_compat_type(fieldtype(T, i)) for i in 1:fieldcount(T))
+    end
+    return false
+end
+
+# Shared companion-method ASTs (`propertynames`, field-wise `==`, `show`) for
+# both `@cdr1_compat` (plain struct) and `@cdr_compact` (variant wrapper).
+# Field access goes through `getproperty`, so the wrapper's transparent CDR2
+# unpacking is honoured and a plain struct falls through to `getfield`. Spliced
+# into the macros' `esc`'d blocks; `name_sym` resolves in the caller's module.
+function _cdr1_emit_companions(name_sym::Symbol, f_names::Vector{Symbol})
+    propnames_tuple = Expr(:tuple, [QuoteNode(n) for n in f_names]...)
+    return Expr[
+        :(Base.propertynames(::$name_sym) = $propnames_tuple),
+        quote
+            function Base.:(==)(_a::$name_sym, _b::$name_sym)
+                for _n in $propnames_tuple
+                    getproperty(_a, _n) == getproperty(_b, _n) || return false
+                end
+                return true
+            end
+        end,
+        quote
+            function Base.show(_io::IO, _v::$name_sym)
+                print(_io, $(string(name_sym)), "(")
+                _first = true
+                for _n in $propnames_tuple
+                    _first || print(_io, ", ")
+                    _first = false
+                    print(_io, _n, "=", repr(getproperty(_v, _n)))
+                end
+                print(_io, ")")
+            end
+        end,
+    ]
+end
+
+"""
+    @cdr1_compat struct Name
+        field1::T1
+        ...
+    end
+
+Define a plain, single concrete struct whose serialization is **standard CDR1 /
+XCDR1** — byte-for-byte what a conventional CDR producer (e.g. a ROS 2
+publisher) emits, including *omitting trailing pad*. Unlike [`@cdr_compact`]
+this emits exactly one type (no `Name{V}` variant union, no padded inner
+structs), so values nest and embed cleanly in other types.
+
+Field types must be primitives, `SArray`s of primitives, or other flat
+CDR1-compatible structs (nesting is allowed and validated recursively).
+Variable-length fields (`String`, `Vector`, `CDRString`, `CDRArray`) are
+rejected — they aren't flat; use [`@cdr_compact`]'s view mode or read them
+through the generic path.
+
+No custom serialization hooks are generated: the value flows through the normal
+`write_all!`/`read` machinery, which flattens it to leaves and resolves CDR1
+offsets at compile time. A struct that ends on its maximum alignment also
+qualifies for the single-store fast path; one that doesn't is written as a
+packed run of constant-offset stores. Either way the wire bytes are standard
+CDR1 with no trailing pad.
+
+The CDR1 wire-compatibility guarantee is for CDR1/XCDR1. The same type still
+encodes correctly under XCDR2 (8-byte primitives are realigned to 4 via
+per-field flattening), but XCDR2 is not this macro's promise.
+"""
+macro cdr1_compat(structdef)
+    name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr1_compat")
+
+    f_types = Type[Base.eval(__module__, te) for te in f_type_exprs]
+    for (i, T) in enumerate(f_types)
+        _is_cdr1_compat_type(T) ||
+            error("@cdr1_compat: field $(f_names[i])::$T is not CDR1-flat-compatible " *
+                  "(must be a primitive, an SArray of primitives, or another flat " *
+                  "CDR1-compatible struct). Variable-length fields are not supported; " *
+                  "use @cdr_compact's CDRString/CDRArray view mode or read them through " *
+                  "the generic path.")
+    end
+
+    field_exprs = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
+    companions  = _cdr1_emit_companions(name_sym, f_names)
+    compat_qual = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
+
+    return esc(quote
+        struct $name_sym
+            $(field_exprs...)
+        end
+        $(companions...)
+        @assert isbitstype($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not isbits"
+        @assert $compat_qual($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not CDR1-flat-compatible"
+    end)
+end
+
 """
     @cdr_compact struct Name
         field1::T1
         ...
     end
 
-Define a struct whose in-memory layout matches its CDR wire encoding —
-both for **CDR1** (8-byte primitives align to 8) and **XCDR2** (8-byte
-primitives align to 4) — by emitting two internal storage structs with
-trailing padding plus a public wrapper `Name{V}` parameterised on variant.
-Both variants qualify for the compact-struct single-store fast path on
-`write_all!` and `read`.
+Define a struct carrying **both** a CDR1 and an XCDR2 layout, behind a public
+wrapper `Name{V}` parameterised on variant. Use this only when one value must
+be serializable under either encoding; **if you only need CDR1/XCDR1, prefer
+[`@cdr1_compat`]** — it emits a single plain concrete type that nests cleanly
+and has no variant union.
 
 The macro emits:
 
-  * `_Name_CDR1` — fields use their natural Julia types plus trailing pad.
+  * `_Name_CDR1` — a flat plain struct of the natural field types (identical to
+    what [`@cdr1_compat`] produces). It serializes as **standard CDR1 with no
+    trailing pad**; a struct that ends on its max alignment additionally takes
+    the single-store fast path.
   * `_Name_CDR2` — 8-byte primitives (and SArrays thereof) substituted with
     `SVector{N, Float32}` so the field alignment drops from 8 to 4, plus
-    trailing pad. The bytes are identical to the original on a host whose
+    trailing pad so its Julia `sizeof` matches the (padded) CDR2 size for the
+    single-store path. The bytes are identical to the original on a host whose
     endianness matches the writer.
   * `Name{V}` — public wrapper holding one of the inner types. Field access
     through `.field` transparently reinterprets the CDR2 storage back to
@@ -186,11 +325,10 @@ Default constructor `Name(args...)` produces a CDR1 value; passing
 inner type so a CDR1 writer paired with a CDR2 wrapper is a `MethodError`,
 not garbage on the wire.
 
-**Wire format note:** the trailing pad fields are part of the wire format —
-each value is `sizeof(_Name_CDR1)` / `sizeof(_Name_CDR2)` bytes, not
-`sum-of-declared-field-sizes`. This is self-consistent for round-trip use
-but **not** wire-compatible with standard CDR producers (e.g. ROS
-publishers), which omit trailing pad.
+**Wire format note:** the CDR1 variant is standard-CDR-compatible (no trailing
+pad). The **CDR2** variant's trailing pad *is* on the wire — its value is
+`sizeof(_Name_CDR2)` bytes, not `sum-of-declared-field-sizes` — so it is not
+wire-compatible with standard CDR producers that omit trailing pad.
 
 **Endianness:** the fast path only fires when writer/reader endianness
 matches the host. On a little-endian host (the common case) use the
@@ -199,28 +337,7 @@ default LE encapsulation.
 Field types must be primitives or `SArray`s of primitives.
 """
 macro cdr_compact(structdef)
-    structdef isa Expr && structdef.head === :struct ||
-        error("@cdr_compact: expected `struct …` definition")
-    is_mutable = structdef.args[1]
-    is_mutable && error("@cdr_compact: mutable structs are not supported")
-    name_part  = structdef.args[2]
-    body       = structdef.args[3]
-
-    name_sym = name_part isa Symbol ? name_part :
-               name_part isa Expr && name_part.head === :curly ? name_part.args[1] :
-               name_part isa Expr && name_part.head === :(<:) ? name_part.args[1] :
-               error("@cdr_compact: unsupported struct name form: $name_part")
-
-    f_names = Symbol[]
-    f_type_exprs = Any[]
-    for ex in body.args
-        ex isa LineNumberNode && continue
-        ex isa Expr && ex.head === :(::) && length(ex.args) == 2 ||
-            error("@cdr_compact: only `field::Type` declarations are supported (got $ex)")
-        push!(f_names, ex.args[1])
-        push!(f_type_exprs, ex.args[2])
-    end
-    isempty(f_names) && error("@cdr_compact: struct has no fields")
+    name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr_compact")
 
     # Opt-in view mode: if any field is declared `CDRString` or
     # `CDRArray{Element}`, emit a buffer-backed view struct read zero-copy.
@@ -243,20 +360,21 @@ macro cdr_compact(structdef)
     inner1 = Symbol("_", name_sym, "_CDR1")
     inner2 = Symbol("_", name_sym, "_CDR2")
 
-    # CDR1: use natural field types.
+    # CDR1: a flat plain struct of the natural field types — no trailing pad,
+    # so it serializes as standard CDR1 (same as `@cdr1_compat`). The CDR1
+    # dispatch hooks below forward to the generic `write_all!`/`read`, which
+    # flatten it to leaves and omit trailing pad on the wire.
     cdr1_raw, cdr1_julia_size, _ = _cdr_compact_layout(f_types, false)
-    cdr1_pad = cdr1_julia_size - cdr1_raw
 
-    # CDR2: substitute 8-byte primitives to drop alignment to 4.
+    # CDR2: substitute 8-byte primitives to drop alignment to 4. This variant
+    # keeps the trailing pad fields because its single-store fast path requires
+    # the Julia layout to match the (padded) CDR2 size exactly.
     cdr2_subst_types = Type[_cdr2_substitute_type(T) for T in f_types]
     cdr2_raw, cdr2_julia_size, _ = _cdr_compact_layout(cdr2_subst_types, true)
     cdr2_pad = cdr2_julia_size - cdr2_raw
 
     # Field-declaration AST for each inner struct.
     cdr1_field_exprs = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
-    for i in 1:cdr1_pad
-        push!(cdr1_field_exprs, Expr(:(::), Symbol("_cdr1_pad", i), :UInt8))
-    end
 
     cdr2_field_exprs = Expr[]
     for (i, T) in enumerate(f_types)
@@ -289,7 +407,7 @@ macro cdr_compact(structdef)
     cdrreader_qual = GlobalRef(@__MODULE__, :CDRReader)
     struct_size_qual = GlobalRef(@__MODULE__, :_struct_cdr_size)
 
-    cdr1_ctor_call = Expr(:call, inner1, f_names..., fill(:(UInt8(0)), cdr1_pad)...)
+    cdr1_ctor_call = Expr(:call, inner1, f_names...)
 
     cdr2_pack_args = [:($pack_qual($(f_type_exprs[i]), $(f_names[i]))) for i in 1:length(f_names)]
     cdr2_ctor_call = Expr(:call, inner2, cdr2_pack_args..., fill(:(UInt8(0)), cdr2_pad)...)
@@ -304,7 +422,8 @@ macro cdr_compact(structdef)
               :(_name === $(QuoteNode(fn)) && return $rhs))
     end
 
-    propnames_tuple = Expr(:tuple, [QuoteNode(n) for n in f_names]...)
+    companions  = _cdr1_emit_companions(name_sym, f_names)
+    compat_qual = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
 
     return esc(quote
         struct $inner1
@@ -325,8 +444,6 @@ macro cdr_compact(structdef)
             end
         end
 
-        Base.propertynames(::$name_sym) = $propnames_tuple
-
         @inline function Base.getproperty(_obj::$name_sym{$inner1}, _name::Symbol)
             _inner = getfield(_obj, :inner)
             _name === :inner && return _inner
@@ -340,23 +457,7 @@ macro cdr_compact(structdef)
             return getfield(_inner, _name)
         end
 
-        function Base.:(==)(_a::$name_sym, _b::$name_sym)
-            for _n in $propnames_tuple
-                getproperty(_a, _n) == getproperty(_b, _n) || return false
-            end
-            return true
-        end
-
-        function Base.show(io::IO, _v::$name_sym)
-            print(io, $(string(name_sym)), "(")
-            _first = true
-            for _n in $propnames_tuple
-                _first || print(io, ", ")
-                _first = false
-                print(io, _n, "=", repr(getproperty(_v, _n)))
-            end
-            print(io, ")")
-        end
+        $(companions...)
 
         # Dispatch hooks: only matching (writer-variant, wrapper-variant)
         # pairs forward to the compact path; mismatches hit the explicit
@@ -387,13 +488,14 @@ macro cdr_compact(structdef)
             $name_sym{$inner2}(read(_r, $inner2))
         end
 
-        # Self-checks. `_struct_cdr_size` returns the same number under both
-        # variants for a struct whose Julia layout already matches CDR for
-        # that variant; this asserts that the layout we engineered actually
-        # round-trips through the layout helpers.
+        # Self-checks. The CDR1 inner is a flat plain struct: its CDR1 wire
+        # size is the data size (`cdr1_raw`, no trailing pad) and it must be
+        # CDR1-flat-compatible. The CDR2 inner keeps trailing pad so its Julia
+        # `sizeof` matches the (padded) CDR2 size for the single-store path.
         @assert sizeof($inner1) == $cdr1_julia_size "@cdr_compact: CDR1 sizeof mismatch for $($(QuoteNode(inner1)))"
+        @assert $struct_size_qual($inner1, false) == $cdr1_raw "@cdr_compact: CDR1 wire size mismatch for $($(QuoteNode(inner1)))"
+        @assert $compat_qual($inner1) "@cdr_compact: CDR1 inner $($(QuoteNode(inner1))) is not CDR1-flat-compatible"
         @assert sizeof($inner2) == $cdr2_julia_size "@cdr_compact: CDR2 sizeof mismatch for $($(QuoteNode(inner2)))"
-        @assert $struct_size_qual($inner1, false) == sizeof($inner1) "@cdr_compact: CDR1 layout helpers disagree for $($(QuoteNode(inner1)))"
         @assert $struct_size_qual($inner2, true) == sizeof($inner2) "@cdr_compact: CDR2 layout helpers disagree for $($(QuoteNode(inner2)))"
     end)
 end
