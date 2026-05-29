@@ -289,6 +289,11 @@ end
     @test propertynames(v) == (:name, :id, :poses, :owned, :flag)
     @test v == read(CDRReader(mem), _RFrameView)
     @test occursin("robot", repr(v))
+
+    # `view(r, ViewStruct)` is an alias of `read(r, ViewStruct)`, for
+    # consistency with view(r, CDRArray{T}) / view(r, CDRString).
+    @test view(CDRReader(mem), _RFrameView) == v
+    @test view(CDRReader(mem), _RFrameView) isa _RFrameView
 end
 
 # A view struct whose dynamic fields are *all* opt-in views (no owned Vector/

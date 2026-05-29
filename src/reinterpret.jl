@@ -294,12 +294,14 @@ end
 """
     view(r::CDRReader, ::Type{CDRArray{T}}) -> CDRArray{T}
     view(r::CDRReader, ::Type{CDRString})   -> CDRString
+    view(r::CDRReader, ::Type{ViewStruct})  -> ViewStruct   # a @cdr_compact view struct
 
 Read the next value as a zero-copy view aliasing the reader's buffer,
 advancing the cursor. Strict: it errors if the view isn't possible (use
 [`canview`](@ref) to branch, or [`read`](@ref) for an owned copy). Mirrors
 `Base.view` — asking for a view is a guarantee, not a hint that may silently
-fall back to a copy.
+fall back to a copy. For a `@cdr_compact` view struct, `view(r, T)` is an alias
+of `read(r, T)` (the struct's view fields already alias the buffer).
 """
 function Base.view(r::CDRReader, ::Type{V}) where {T, V <: CDRArray{T}}
     canview(r, V) || throw(ArgumentError(string("view: cannot alias ", V,
@@ -447,6 +449,11 @@ function _cdr_view_emit(name_sym::Symbol, f_names::Vector{Symbol}, f_type_exprs:
             _S = typeof($buf_data(_r.src))
             return $name_sym{_S}($(read_args...))
         end
+
+        # `view` alias for consistency with `view(r, CDRArray{T})` /
+        # `view(r, CDRString)`: a view struct's view fields alias the buffer.
+        Base.view(_r::$reader{B}, ::Type{$name_sym}) where {B <: $buflike} =
+            Base.read(_r, $name_sym)
 
         Base.propertynames(::$name_sym) = $propnames
 
