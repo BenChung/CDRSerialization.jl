@@ -261,10 +261,14 @@ macro cdr_compact(structdef)
     cdr2_field_exprs = Expr[]
     for (i, T) in enumerate(f_types)
         ST = cdr2_subst_types[i]
+        # Interpolate the `Float32` *type object* (not a bare symbol): the
+        # emitted expr is `esc`'d into the caller's module, and a caller that
+        # defines a type named `Float32` (e.g. a `std_msgs/Float32` message
+        # struct) would otherwise shadow `Base.Float32` here.
         type_expr = ST === T ? f_type_exprs[i] :
                     ST <: SArray && ST.parameters[2] === Float32 ?
-                        :($(GlobalRef(StaticArrays, :SVector)){$(ST.parameters[4]), Float32}) :
-                        :($(GlobalRef(StaticArrays, :SVector)){2, Float32})
+                        :($(GlobalRef(StaticArrays, :SVector)){$(ST.parameters[4]), $Float32}) :
+                        :($(GlobalRef(StaticArrays, :SVector)){2, $Float32})
         push!(cdr2_field_exprs, Expr(:(::), f_names[i], type_expr))
     end
     for i in 1:cdr2_pad
