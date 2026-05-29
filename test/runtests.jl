@@ -473,19 +473,20 @@ end
 
 # A naturally-non-compact struct (Float64 then UInt8 → 7 trailing pad bytes
 # in Julia, only 9 bytes in standard CDR). @cdr_compact emits two inner
-# storage types — one each for CDR1 (Float64 aligns to 8 → 7 trailing pad)
-# and XCDR2 (Float64 aligns to 4 → 3 trailing pad) — and a public wrapper
-# `_PadCompact{V}` that dispatches on variant.
+# storage types: CDR1 is a flat plain struct that serializes as standard CDR
+# (9 bytes, no trailing pad), XCDR2 keeps trailing pad for its single-store
+# path (Float64-as-2xF32 aligns to 4 → 3 trailing pad). A public wrapper
+# `_PadCompact{V}` dispatches on variant.
 @cdr_compact struct _PadCompact
     x::Float64
     y::UInt8
 end
 
-@testset "@cdr_compact: CDR1 inner layout + compact path" begin
+@testset "@cdr_compact: CDR1 inner layout is wire-compatible" begin
     Inner = var"__PadCompact_CDR1"
-    @test sizeof(Inner) == 16
-    @test CDRSerialization.iscompact(Inner)            # CDR1, host endianness
-    @test CDRSerialization._struct_cdr_size(Inner, false) == 16
+    @test sizeof(Inner) == 16                          # Julia pads to 8-align
+    @test !CDRSerialization.iscompact(Inner)           # has trailing pad → not single-store
+    @test CDRSerialization._struct_cdr_size(Inner, false) == 9   # CDR1 wire size, no trailing pad
 
     val = _PadCompact(3.14, 0x42)             # default → CDR1 variant
     @test val isa _PadCompact{Inner}
@@ -495,7 +496,7 @@ end
     data = IOBuffer()
     w = CDRSerialization.CDRWriter(data)     # default CDR_LE → CDR1
     CDRSerialization.write_all!(w, val)
-    @test position(w) == 4 + 16              # preamble + 16 bytes
+    @test position(w) == 4 + 9               # preamble + 9 wire bytes (no trailing pad)
 
     seekstart(data)
     r = CDRSerialization.CDRReader(data)
@@ -584,6 +585,100 @@ end
     data2 = IOBuffer()
     w_cdr1 = CDRSerialization.CDRWriter(data2)
     @test_throws ArgumentError CDRSerialization.write_all!(w_cdr1, cdr2_val)
+end
+
+# @cdr1_compat: a single flat plain struct, standard-CDR (no trailing pad),
+# safe to nest/embed. _C1Pad has trailing pad in Julia (9 wire bytes), _C1Vec
+# is naturally compact, _C1Nest/_C1Outer exercise nesting.
+@cdr1_compat struct _C1Pad
+    x::Float64
+    y::UInt8
+end
+@cdr1_compat struct _C1Vec
+    v::SVector{3, Float64}
+end
+@cdr1_compat struct _C1Nest
+    a::_C1Pad
+    b::UInt32
+end
+@cdr1_compat struct _C1Outer
+    head::_C1Pad
+    tail::UInt16
+end
+
+@testset "@cdr1_compat: single concrete type, standard-CDR wire format" begin
+    # One plain concrete type — not a {V} variant union.
+    @test isconcretetype(_C1Pad)
+    @test !(_C1Pad isa UnionAll)
+    @test fieldnames(_C1Pad) == (:x, :y)
+
+    val = _C1Pad(3.14, 0x42)
+    @test val.x == 3.14 && val.y == 0x42
+    @test propertynames(val) == (:x, :y)
+
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, val)
+    @test position(w) == 4 + 9                          # 9 wire bytes, no trailing pad
+    @test bytes2hex(collect(CDRSerialization.data(w)[5:end])) == "1f85eb51b81e094042"  # 3.14 LE + 0x42
+
+    seekstart(data)
+    got = read(CDRSerialization.CDRReader(data), _C1Pad)
+    @test got == val
+
+    # Single-value `write` fallback forwards to write_all!, returns byte count.
+    d3 = IOBuffer(); w3 = CDRSerialization.CDRWriter(d3)
+    @test write(w3, val) == 9
+    @test collect(CDRSerialization.data(w3)) == collect(CDRSerialization.data(w))
+
+    # Identical wire bytes to @cdr_compact's CDR1 variant of the same fields.
+    d2 = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(d2), _PadCompact(3.14, 0x42))
+    @test collect(CDRSerialization.data(w)) == collect(d2.data[1:position(d2)])
+end
+
+@testset "@cdr1_compat: naturally-compact struct takes the fast path" begin
+    @test CDRSerialization.iscompact(_C1Vec)            # 24 bytes, no trailing pad
+    v = _C1Vec(SVector{3, Float64}(1.0, 2.0, 3.0))
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, v)
+    @test position(w) == 4 + 24
+    seekstart(data)
+    @test read(CDRSerialization.CDRReader(data), _C1Vec) == v
+end
+
+@testset "@cdr1_compat: nesting and embedding stay wire-compatible" begin
+    nest = _C1Nest(_C1Pad(1.0, 0xAB), UInt32(0x11223344))
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    CDRSerialization.write_all!(w, nest)
+    # _C1Pad's 9 data bytes, then b aligns to offset 12 — exactly standard CDR,
+    # with the alignment gap zeroed.
+    @test bytes2hex(collect(CDRSerialization.data(w)[5:end])) ==
+          "000000000000f03fab00000044332211"
+    seekstart(data)
+    @test read(CDRSerialization.CDRReader(data), _C1Nest) == nest
+
+    outer = _C1Outer(_C1Pad(2.5, 0x07), UInt16(0xBEEF))
+    d2 = IOBuffer()
+    w2 = CDRSerialization.CDRWriter(d2)
+    CDRSerialization.write_all!(w2, outer)
+    seekstart(d2)
+    @test read(CDRSerialization.CDRReader(d2), _C1Outer) == outer
+
+    # Size calculator agrees with the writer for the nested value.
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, nest)
+    @test position(calc) == position(w)
+end
+
+@testset "@cdr1_compat: variable-length fields are rejected" begin
+    @test_throws LoadError @eval @cdr1_compat struct _C1Bad
+        s::String
+    end
+    @test_throws LoadError @eval @cdr1_compat struct _C1BadVec
+        v::Vector{Float64}
+    end
 end
 
 @testset "SVector{Struct} round-trip (no length prefix)" begin

@@ -255,8 +255,9 @@ Variable-length fields (`String`, `Vector`, `CDRString`, `CDRArray`) are
 rejected — they aren't flat; use [`@cdr_compact`]'s view mode or read them
 through the generic path.
 
-No custom serialization hooks are generated: the value flows through the normal
-`write_all!`/`read` machinery, which flattens it to leaves and resolves CDR1
+Aside from a `write(c, v)` forwarder to `write_all!`, no custom serialization
+hooks are generated: the value flows through the normal `write_all!`/`read`
+machinery, which flattens it to leaves and resolves CDR1
 offsets at compile time. A struct that ends on its maximum alignment also
 qualifies for the single-store fast path; one that doesn't is written as a
 packed run of constant-offset stores. Either way the wire bytes are standard
@@ -279,15 +280,27 @@ macro cdr1_compat(structdef)
                   "the generic path.")
     end
 
-    field_exprs = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
-    companions  = _cdr1_emit_companions(name_sym, f_names)
-    compat_qual = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
+    field_exprs    = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
+    companions     = _cdr1_emit_companions(name_sym, f_names)
+    compat_qual    = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
+    write_all_qual = GlobalRef(@__MODULE__, :write_all!)
+    cdrwriter_qual = GlobalRef(@__MODULE__, :CDRWriter)
 
     return esc(quote
         struct $name_sym
             $(field_exprs...)
         end
         $(companions...)
+
+        # Single-value `write` fallback: forward to `write_all!` (the generic
+        # path handles flattening + CDR1 offsets) and return the byte count, as
+        # `Base.write` callers expect.
+        function Base.write(_c::$cdrwriter_qual, _x::$name_sym)
+            _p0 = position(_c)
+            $write_all_qual(_c, _x)
+            return position(_c) - _p0
+        end
+
         @assert isbitstype($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not isbits"
         @assert $compat_qual($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not CDR1-flat-compatible"
     end)
