@@ -302,6 +302,41 @@ end
     @test occursin("robot", repr(v))
 end
 
+# A view struct whose dynamic fields are *all* opt-in views (no owned Vector/
+# String), so decoding + using it touches the buffer only — must be
+# allocation-free regardless of how large `points` is.
+@cdr_compact struct _RCloudView
+    seq::UInt32
+    points::CDRArray{_RPoint}
+    frame::CDRString
+end
+
+# Decode then use fields without letting the view escape (the normal pattern).
+function _use_cloud(r)
+    v = read(r, _RCloudView)
+    s = 0.0
+    @inbounds for i in eachindex(v.points)
+        s += v.points[i].x
+    end
+    return s + v.seq + ncodeunits(v.frame)
+end
+
+@testset "AllocCheck: @cdr_compact view decode of a large array is allocation-free" begin
+    RT = CDRReader{CDRSerialization.MemBuf{Memory{UInt8}}, false, true}
+    @test isempty(check_allocs(_use_cloud, (RT,)))
+
+    # And it's genuinely O(1) in allocation as the array grows.
+    for N in (4, 1024, 65536)
+        io = IOBuffer()
+        write_all!(CDRWriter(io), UInt32(7),
+                   [_RPoint(Float64(i), 2.0, 3.0) for i in 1:N], "frame")
+        r = CDRReader(take!(io))
+        _use_cloud(r)                       # warmup / compile
+        seek(r.src, 4); r.origin = 4
+        @test (@allocated _use_cloud(r)) == 0
+    end
+end
+
 @testset "@cdr_compact: view detection is syntactic + opt-in" begin
     @test CDRSerialization._cdr_has_view_fields(Any[:Float64, :UInt8]) == false
     @test CDRSerialization._cdr_has_view_fields(Any[:(Vector{Float64})]) == false   # plain, not a view
