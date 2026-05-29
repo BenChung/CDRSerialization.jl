@@ -25,28 +25,20 @@ Base.:(==)(a::_RPoint, b::_RPoint) = a.x == b.x && a.y == b.y && a.z == b.z
 Base.:(==)(a::_RQuat, b::_RQuat) = a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w
 Base.:(==)(a::_RPose, b::_RPose) = a.position == b.position && a.orientation == b.orientation
 
-@testset "reinterpret_struct: reader returns the value" begin
+@testset "compact struct: read single-loads + iscompact reports it" begin
     mem = Memory{UInt8}(undef, 128)
     w = CDRWriter(mem)
     pose = _RPose(_RPoint(1.0, 2.0, 3.0), _RQuat(0.1, 0.2, 0.3, 0.4))
-    write_all!(w, pose)
+    write_all!(w, pose, UInt32(0xCAFE))
 
     r = CDRReader(mem)
-    v = reinterpret_struct(r, _RPose)
-    @test v isa _RPose
-    @test v == pose
-    # Matches the value-returning `read` exactly.
-    @test reinterpret_struct(CDRReader(mem), _RPose) == read(CDRReader(mem), _RPose)
-end
+    @test iscompact(r, _RPose)            # read(r, _RPose) is a single unsafe_load
+    @test read(r, _RPose) == pose
+    @test read(r, UInt32) == 0xCAFE       # cursor advanced exactly past the struct
 
-@testset "reinterpret_struct: reader advances the cursor" begin
-    mem = Memory{UInt8}(undef, 128)
-    w = CDRWriter(mem)
-    write_all!(w, _RPoint(1.0, 2.0, 3.0), UInt32(0xCAFE))
-
-    r = CDRReader(mem)
-    @test reinterpret_struct(r, _RPoint) == _RPoint(1.0, 2.0, 3.0)
-    @test read(r, UInt32) == 0xCAFE   # cursor sits right after the struct
+    # The reader-less form agrees (host endianness, CDR1).
+    @test iscompact(_RPose)
+    @test !iscompact(_RHasString)
 end
 
 @testset "reinterpret_struct: standalone over Memory + Vector" begin
@@ -68,10 +60,6 @@ end
     @test_throws ArgumentError reinterpret_struct(buf, _RHasString, 0)
     @test_throws BoundsError reinterpret_struct(buf, _RPoint, 60)
     @test_throws BoundsError reinterpret_struct(buf, _RPoint, -1)
-
-    # Non-compact is rejected on the reader path too.
-    mem = Memory{UInt8}(undef, 64)
-    @test_throws ArgumentError reinterpret_struct(CDRReader(mem), _RHasString)
 end
 
 @testset "reinterpret_array: length-prefixed sequence as a view" begin
@@ -81,7 +69,7 @@ end
     write_all!(w, poses)              # u32 length prefix + 3 packed structs
 
     r = CDRReader(mem)
-    av = reinterpret_array(r, _RPoint)
+    av = view(r, CDRArray{_RPoint})
     @test av isa CDRArray{_RPoint}
     @test av isa AbstractVector{_RPoint}
     @test length(av) == 3
@@ -99,37 +87,37 @@ end
     mem = Memory{UInt8}(undef, 128)
     write_all!(CDRWriter(mem), poses)
 
-    av = reinterpret_array(CDRReader(mem), _RPoint)
+    av = view(CDRReader(mem), CDRArray{_RPoint})
     # Store an element back in place; a fresh view over the same bytes sees it.
     av[1] = _RPoint(-9.0, -8.0, -7.0)
-    av2 = reinterpret_array(CDRReader(mem), _RPoint)
+    av2 = view(CDRReader(mem), CDRArray{_RPoint})
     @test av2[1] == _RPoint(-9.0, -8.0, -7.0)
     @test av2[2] == _RPoint(4.0, 5.0, 6.0)
     # And the plain reader path agrees.
     @test read(CDRReader(mem), Vector{_RPoint})[1] == _RPoint(-9.0, -8.0, -7.0)
 end
 
-@testset "reinterpret_array: fixed length (no prefix) + advances cursor" begin
+@testset "view CDRArray: fixed length (no prefix) via internal _view_array" begin
     poses = [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0), _RPoint(7.0, 8.0, 9.0)]
     mem = Memory{UInt8}(undef, 256)
     w = CDRWriter(mem)
     write_all!(w, SVector(poses...), UInt32(0xBEEF))   # SArray of struct → no length prefix
 
     r = CDRReader(mem)
-    av = reinterpret_array(r, _RPoint; num=3)
+    av = CDRSerialization._view_array(r, _RPoint; num=3)   # no-prefix path (internal)
     @test av == poses
     @test read(r, UInt32) == 0xBEEF   # cursor advanced past the elements
 end
 
-@testset "reinterpret_array: empty sequence" begin
+@testset "view CDRArray: empty sequence" begin
     mem = Memory{UInt8}(undef, 64)
     write_all!(CDRWriter(mem), _RPoint[])
-    av = reinterpret_array(CDRReader(mem), _RPoint)
+    av = view(CDRReader(mem), CDRArray{_RPoint})
     @test length(av) == 0
     @test collect(av) == _RPoint[]
 end
 
-@testset "reinterpret_array: standalone + rejects non-compact / OOB" begin
+@testset "view CDRArray: standalone reinterpret + rejects non-compact / OOB" begin
     poses = [_RPoint(-1.0, -2.0, -3.0), _RPoint(0.0, 0.0, 0.0)]
     vec = Vector{UInt8}(undef, 128)
     write_all!(CDRWriter(vec), SVector(poses...))   # no prefix → elements at offset 4
@@ -138,7 +126,8 @@ end
     buf = Vector{UInt8}(undef, 64)
     @test_throws ArgumentError reinterpret_array(buf, _RHasString, 0, 1)
     @test_throws BoundsError reinterpret_array(buf, _RPoint, 0, 10)
-    @test_throws ArgumentError reinterpret_array(CDRReader(Memory{UInt8}(undef, 64)), _RHasString; num=1)
+    # view is strict: a non-compact element can't be aliased → error.
+    @test_throws ArgumentError view(CDRReader(Memory{UInt8}(undef, 64)), CDRArray{_RHasString})
 end
 
 struct _RFrame
@@ -222,7 +211,7 @@ end
     write(w, UInt8(42))
 
     r = CDRReader(mem)
-    s = reinterpret_string(r)
+    s = view(r, CDRString)
     @test s isa CDRString
     @test s == str                         # value-equal, no copy
     @test length(s) == length(str)         # char count (multibyte aware)
@@ -238,7 +227,7 @@ end
     write(w, "")
     write(w, UInt8(7))
     r = CDRReader(mem)
-    s = reinterpret_string(r)
+    s = view(r, CDRString)
     @test s == ""
     @test ncodeunits(s) == 0
     @test read(r, UInt8) == 7

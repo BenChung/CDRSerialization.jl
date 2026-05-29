@@ -51,38 +51,9 @@ function reinterpret_struct(mem::DenseVector{UInt8}, ::Type{T}, byte_offset::Int
     return GC.@preserve mem unsafe_load(Ptr{T}(pointer(mem, off + 1)))
 end
 
-"""
-    reinterpret_struct(r::CDRReader, ::Type{T}) -> T
-
-Load a `T` from the reader's buffer at the current position (after CDR
-alignment) via a single `unsafe_load`, advancing the cursor by `sizeof(T)`.
-Only IOBuffer-/MemBuf-backed readers are supported. Throws an `ArgumentError`
-unless `T` is a compact struct for the reader's encapsulation variant.
-
-Equivalent to `read(r, T)` for a compact struct, but *asserts* the
-single-load layout rather than silently falling back to a field-by-field
-decode — use it when zero-copy is a requirement, not just an optimisation.
-"""
-@generated function reinterpret_struct(r::R, ::Type{T}) where {R <: CDRReader{<:_CDRBufLike}, T}
-    isCDR2 = R.parameters[2]
-    LE     = R.parameters[3]
-    if !_is_compact_struct(T, isCDR2, LE)
-        return :(throw(ArgumentError(string("reinterpret_struct: ", $T,
-            " is not a compact struct for this stream variant"))))
-    end
-    max_align = _wa_align_for(T, isCDR2)
-    sz = sizeof(T)
-    return quote
-        align(r, $max_align)
-        src = r.src
-        mem = _buf_data(src)
-        off = _buf_pos(src) - 1            # 0-based byte offset
-        off + $sz <= _buf_size(src) || throw(BoundsError(mem, off + $sz))
-        v = GC.@preserve mem unsafe_load(Ptr{$T}(pointer(mem, off + 1)))
-        _buf_pos!(src, off + 1 + $sz)
-        return v
-    end
-end
+# Note: there is no reader-form `reinterpret_struct(r, T)`. For a struct the
+# zero-copy read is a single-load *value* (nothing to alias), which `read(r, T)`
+# already produces for a compact struct; `iscompact(r, T)` asserts that path.
 
 # A CDR sequence of a compact struct is bit-identical to a contiguous block of
 # that struct: compact means no trailing pad, so consecutive elements sit
@@ -96,7 +67,8 @@ A zero-copy, owned array view of compact structs `T` laid out contiguously in
 a byte buffer `S` (`Memory{UInt8}` or `Vector{UInt8}`). The buffer is held as
 a field, so it stays alive for the array's lifetime — no `collect` needed and
 no dangling. Indexing loads an element straight from the bytes; assigning
-stores one back in place. Construct via [`reinterpret_array`](@ref).
+stores one back in place. Obtain one via `view(r, CDRArray{T})` from a reader,
+or [`reinterpret_array`](@ref) over a raw buffer.
 """
 struct CDRArray{T, S <: DenseVector{UInt8}} <: AbstractVector{T}
     mem::S
@@ -145,20 +117,13 @@ function reinterpret_array(mem::DenseVector{UInt8}, ::Type{T},
     return CDRArray{T}(mem, off, n)
 end
 
-"""
-    reinterpret_array(r::CDRReader, ::Type{T}; num=<sequence length>) -> CDRArray{T}
-
-Read a CDR sequence of compact structs `T` as a zero-copy [`CDRArray`](@ref)
-over the reader's buffer, advancing the cursor past the elements. By default
-the element count is taken from the stream's `UInt32` length prefix (as
-`read(r, Vector{T})` does); pass `num` for a fixed-length array with no prefix.
-`T` must be compact for the reader's encapsulation variant.
-"""
-function reinterpret_array(r::CDRReader{B, IsCDR2, LE}, ::Type{T};
-                           num=sequenceLength(r)) where {B <: _CDRBufLike, IsCDR2, LE, T}
-    _is_view_eltype(T, IsCDR2, LE) ||
-        throw(ArgumentError(string("reinterpret_array: ", T,
-                                   " is not a compact element type for this stream variant")))
+# Internal: view a CDR sequence of compact element `T` over the reader's
+# buffer, advancing past the elements. The public reader spelling is
+# `view(r, CDRArray{T})`; this is also used by `read_view` and the
+# `@cdr_compact` view-struct decode. `num` defaults to the stream's UInt32
+# length prefix; pass it for a fixed-length sequence with no prefix.
+function _view_array(r::CDRReader{B, IsCDR2, LE}, ::Type{T};
+                     num=sequenceLength(r)) where {B <: _CDRBufLike, IsCDR2, LE, T}
     align(r, _wa_align_for(T, IsCDR2))
     src = r.src
     mem = _buf_data(src)
@@ -181,7 +146,8 @@ A zero-copy view of a UTF-8 string living in a byte buffer `S` (`Memory{UInt8}`
 or `Vector{UInt8}`). The buffer is held as a field, so it stays alive for the
 string's lifetime. Implements the `AbstractString` interface, so it iterates,
 compares, prints, and interpolates like any string; `String(s)` materialises
-an owned copy. Construct via [`reinterpret_string`](@ref).
+an owned copy. Obtain one via `view(r, CDRString)` from a reader, or
+[`reinterpret_string`](@ref) over a raw buffer.
 """
 struct CDRString{S <: DenseVector{UInt8}} <: AbstractString
     mem::S
@@ -257,14 +223,9 @@ function reinterpret_string(mem::DenseVector{UInt8}, byte_offset::Integer, nbyte
     return CDRString(mem, off, n)
 end
 
-"""
-    reinterpret_string(r::CDRReader) -> CDRString
-
-Read a CDR string as a zero-copy [`CDRString`](@ref) over the reader's buffer,
-advancing the cursor past the content and its null terminator. Mirrors
-`read(r, String)` but aliases the buffer instead of copying.
-"""
-function reinterpret_string(r::CDRReader{B}) where {B <: _CDRBufLike}
+# Internal: view a CDR string over the reader's buffer, advancing past the
+# content and null terminator. Public reader spelling is `view(r, CDRString)`.
+function _view_string(r::CDRReader{B}) where {B <: _CDRBufLike}
     len = Int(sequenceLength(r))       # CDR length: content + null terminator
     src = r.src
     mem = _buf_data(src)
@@ -302,6 +263,18 @@ than walking it field by field. A compile-time constant.
 end
 
 """
+    iscompact(::Type{T}; cdr2=false) -> Bool
+
+Reader-less form: whether `T`'s in-memory layout matches its CDR wire encoding
+under the given variant (host endianness assumed), i.e. whether it can be read
+or written as a single `unsafe_load`/`unsafe_store!`. A compile-time constant.
+"""
+@inline iscompact(::Type{T}; cdr2::Bool=false) where T = _iscompact_host(T, Val(cdr2))
+@generated function _iscompact_host(::Type{T}, ::Val{C}) where {T, C}
+    return :($(_is_compact_struct(T, C, ENDIAN_BOM == 0x04030201)))
+end
+
+"""
     canview(r::CDRReader, ::Type{CDRArray{T}}) -> Bool
     canview(r::CDRReader, ::Type{CDRString})   -> Bool
 
@@ -328,8 +301,16 @@ advancing the cursor. Strict: it errors if the view isn't possible (use
 `Base.view` — asking for a view is a guarantee, not a hint that may silently
 fall back to a copy.
 """
-Base.view(r::CDRReader, ::Type{V}) where {T, V <: CDRArray{T}} = reinterpret_array(r, T)
-Base.view(r::CDRReader, ::Type{CDRString}) = reinterpret_string(r)
+function Base.view(r::CDRReader, ::Type{V}) where {T, V <: CDRArray{T}}
+    canview(r, V) || throw(ArgumentError(string("view: cannot alias ", V,
+        " for this reader — element ", T, " is not compact under its variant/endianness")))
+    return _view_array(r, T)
+end
+function Base.view(r::CDRReader, ::Type{CDRString})
+    canview(r, CDRString) || throw(ArgumentError(
+        "view: cannot alias CDRString (reader is not buffer-backed)"))
+    return _view_string(r)
+end
 
 # Read one field for `read_view`. Every branch condition is a compile-time
 # constant (a property of `FT`/`IsCDR2`/`LE`), so the compiler prunes this to
@@ -342,11 +323,11 @@ Base.view(r::CDRReader, ::Type{CDRString}) = reinterpret_string(r)
     if FT <: StaticArray || _is_packed_type(FT)
         return read(r, FT)
     elseif FT <: AbstractString
-        return reinterpret_string(r)        # zero-copy CDRString view
+        return _view_string(r)              # zero-copy CDRString view
     elseif FT <: AbstractVector
         ET = eltype(FT)
         if _is_view_eltype(ET, IsCDR2, LE)
-            return reinterpret_array(r, ET)
+            return _view_array(r, ET)
         else
             return read(r, FT)
         end
@@ -423,8 +404,8 @@ _cdr_has_view_fields(f_type_exprs) =
 function _cdr_view_emit(name_sym::Symbol, f_names::Vector{Symbol}, f_type_exprs::Vector)
     cdrarray   = GlobalRef(@__MODULE__, :CDRArray)
     cdrstring  = GlobalRef(@__MODULE__, :CDRString)
-    ri_string  = GlobalRef(@__MODULE__, :reinterpret_string)
-    ri_array   = GlobalRef(@__MODULE__, :reinterpret_array)
+    ri_string  = GlobalRef(@__MODULE__, :_view_string)
+    ri_array   = GlobalRef(@__MODULE__, :_view_array)
     buf_data   = GlobalRef(@__MODULE__, :_buf_data)
     reader     = GlobalRef(@__MODULE__, :CDRReader)
     buflike    = GlobalRef(@__MODULE__, :_CDRBufLike)

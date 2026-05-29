@@ -484,7 +484,7 @@ end
 @testset "@cdr_compact: CDR1 inner layout + compact path" begin
     Inner = var"__PadCompact_CDR1"
     @test sizeof(Inner) == 16
-    @test CDRSerialization._is_compact_struct(Inner, false, true)
+    @test CDRSerialization.iscompact(Inner)            # CDR1, host endianness
     @test CDRSerialization._struct_cdr_size(Inner, false) == 16
 
     val = _PadCompact(3.14, 0x42)             # default → CDR1 variant
@@ -508,7 +508,7 @@ end
 @testset "@cdr_compact: CDR2 inner layout + compact path" begin
     Inner = var"__PadCompact_CDR2"
     @test sizeof(Inner) == 12                # 8 (Float64-as-2xF32) + 1 + 3 pad
-    @test CDRSerialization._is_compact_struct(Inner, true, true)
+    @test CDRSerialization.iscompact(Inner; cdr2=true)
     @test CDRSerialization._struct_cdr_size(Inner, true) == 12
 
     val = _PadCompact(3.14, 0x42; xcdr2=true)
