@@ -881,34 +881,68 @@ end
 @testset "cdr_layout surfaces the capability tier + reason" begin
     # compact (leads with max-align field, no trailing pad): all capabilities.
     lc = cdr_layout(_TestPoint)
-    @test lc.fixed_size && lc.single_op && lc.viewable
+    @test lc.fixed && lc.compact && lc.viewable
     @test lc isa CDRLayout
 
-    # flat but trailing pad → fixed-size, but not single-op / viewable.
+    # fixed but trailing pad → fixed, but not compact / viewable.
     lp = cdr_layout(_C1Pad)                       # {Float64; UInt8}, from earlier testset
-    @test lp.fixed_size && !lp.single_op && !lp.viewable
+    @test lp.fixed && !lp.compact && !lp.viewable
     @test occursin("trailing padding", lp.why)
 
-    # flat but leads with a narrow field → fixed-size, not single-op / viewable.
+    # fixed but leads with a narrow field → fixed, not compact / viewable.
     ln = cdr_layout(_LeadSmall)                    # {UInt16; Float64}
-    @test ln.fixed_size && !ln.single_op && !ln.viewable
+    @test ln.fixed && !ln.compact && !ln.viewable
     @test occursin("leads with", ln.why)
 
     # dynamic (has a String/Vector) → none of the three.
     ld = cdr_layout(_TestInner)                    # {String; Vector{Float64}}
-    @test !ld.fixed_size && !ld.single_op && !ld.viewable
+    @test !ld.fixed && !ld.compact && !ld.viewable
     @test occursin("variable-length", ld.why)
 
-    # the nesting holds: viewable ⟹ single_op ⟹ fixed_size for each.
+    # the nesting holds: viewable ⟹ compact ⟹ fixed for each.
     for T in (_TestPoint, _C1Pad, _LeadSmall, _TestInner, Float64)
         l = cdr_layout(T)
-        @test !l.viewable || l.single_op
-        @test !l.single_op || l.fixed_size
+        @test !l.viewable || l.compact
+        @test !l.compact || l.fixed
     end
 
     # cdr_layout agrees with the iscompact predicate.
-    @test cdr_layout(_TestPoint).single_op == CDRSerialization.iscompact(_TestPoint)
-    @test cdr_layout(_LeadSmall).single_op == CDRSerialization.iscompact(_LeadSmall)
+    @test cdr_layout(_TestPoint).compact == CDRSerialization.iscompact(_TestPoint)
+    @test cdr_layout(_LeadSmall).compact == CDRSerialization.iscompact(_LeadSmall)
+end
+
+# New macro name: @cdr_fixed (was @cdr1_compat). Same fixed-size value type.
+@cdr_fixed struct _FixedPad
+    x::Float64
+    y::UInt8
+end
+@cdr_fixed struct _FixedVec
+    v::SVector{3, Float64}
+end
+# Deprecated alias must still define an equivalent type.
+@cdr1_compat struct _CompatPad
+    x::Float64
+    y::UInt8
+end
+
+@testset "@cdr_fixed and the @cdr1_compat alias" begin
+    # @cdr_fixed produces a plain fixed-size struct, standard CDR1, no trailing pad.
+    val = _FixedPad(3.14, 0x42)
+    @test fieldnames(_FixedPad) == (:x, :y)
+    @test cdr_layout(_FixedPad).fixed && !cdr_layout(_FixedPad).compact   # trailing pad
+    data = IOBuffer(); w = CDRSerialization.CDRWriter(data)
+    @test write(w, val) == 9                          # 9 wire bytes, no trailing pad
+    seekstart(data)
+    @test read(CDRSerialization.CDRReader(data), _FixedPad) == val
+
+    # A naturally-compact @cdr_fixed struct reaches the compact tier.
+    @test cdr_layout(_FixedVec).compact && cdr_layout(_FixedVec).viewable
+    @test CDRSerialization.iscompact(_FixedVec)
+
+    # The deprecated @cdr1_compat alias produces a byte-identical encoding.
+    d1 = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(d1), _FixedPad(2.5, 0x07))
+    d2 = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(d2), _CompatPad(2.5, 0x07))
+    @test take!(d1) == take!(d2)
 end
 
 @testset "view error message explains why and points to the owned read" begin

@@ -368,7 +368,6 @@ end
     @test m isa _RFrame
     @test m.poses isa Vector{_RPoint} && m.samples isa Vector{Float64}
     @test read_view(CDRReader(fmem), _RFrame) == m          # view value-equals the copy
-    @test convert(_RFrame, read_view(CDRReader(fmem), _RFrame)) isa _RFrame   # convert(T, v) alias
 
     fill!(fmem, 0xFF)                                       # scribble the source buffer
     @test m.poses == [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0)]
@@ -442,6 +441,31 @@ end
     # consistency with view(r, CDRArray{T}) / view(r, CDRString).
     @test view(CDRReader(mem), _RFrameView) == v
     @test view(CDRReader(mem), _RFrameView) isa _RFrameView
+end
+
+# Same view struct via the new `@cdr_view` macro (the home of view mode now;
+# `@cdr_compact`'s CDRString/CDRArray fields are the deprecated spelling).
+@cdr_view struct _RFrameView2
+    name::CDRString
+    id::UInt32
+    poses::CDRArray{SVector{3, Float64}}
+    owned::Vector{Float64}
+    flag::UInt8
+end
+
+@testset "@cdr_view: buffer-backed view struct (new macro name)" begin
+    val = _RFramePlain("robot", 7,
+                       [SVector(1.0, 2.0, 3.0), SVector(4.0, 5.0, 6.0)],
+                       [10.0, 20.0, 30.0], 0x09)
+    mem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(mem), val)
+
+    v = read(CDRReader(mem), _RFrameView2)
+    @test v isa _RFrameView2{Memory{UInt8}}
+    @test v.name isa CDRString && v.name == "robot"
+    @test v.poses isa CDRArray{SVector{3, Float64}} && v.poses[2] == SVector(4.0, 5.0, 6.0)
+    @test v.owned == [10.0, 20.0, 30.0] && v.flag == 0x09
+    @test view(CDRReader(mem), _RFrameView2) == v
 end
 
 # A view struct whose dynamic fields are *all* opt-in views (no owned Vector/

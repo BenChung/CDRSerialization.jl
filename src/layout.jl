@@ -260,58 +260,24 @@ function _cdr1_emit_companions(name_sym::Symbol, f_names::Vector{Symbol})
     ]
 end
 
-"""
-    @cdr1_compat struct Name
-        field1::T1
-        ...
-    end
-
-Define a plain, single concrete struct whose serialization is **standard CDR1 /
-XCDR1** — byte-for-byte what a conventional CDR producer (e.g. a ROS 2
-publisher) emits, including *omitting trailing pad*. Unlike [`@cdr_compact`]
-this emits exactly one type (no `Name{V}` variant union, no padded inner
-structs), so values nest and embed cleanly in other types.
-
-Field types must be primitives, `SArray`s of primitives, or other flat
-CDR1-compatible structs (nesting is allowed and validated recursively).
-Variable-length fields (`String`, `Vector`, `CDRString`, `CDRArray`) are
-rejected — they aren't flat; use [`@cdr_compact`]'s view mode or read them
-through the generic path.
-
-Aside from a `write(c, v)` forwarder to `write_all!`, no custom serialization
-hooks are generated: the value flows through the normal `write_all!`/`read`
-machinery, which flattens it to leaves and resolves CDR1
-offsets at compile time. A struct that ends on its maximum alignment also
-qualifies for the single-store fast path; one that doesn't is written as a
-packed run of constant-offset stores. Either way the wire bytes are standard
-CDR1 with no trailing pad.
-
-The CDR1 wire-compatibility guarantee is for CDR1/XCDR1. The same type still
-encodes correctly under XCDR2 (8-byte primitives are realigned to 4 via
-per-field flattening), but XCDR2 is not this macro's promise.
-
-Whether the resulting type *also* reads/writes as a single load/store and is
-zero-copy `CDRArray`-viewable depends on its field layout (it must lead with its
-widest-aligned field and have no trailing pad) — this macro does **not**
-guarantee it. Call [`cdr_layout`](@ref)`(T)` (or [`iscompact`](@ref)`(T)`) to see
-which tier your type lands in and why.
-"""
-macro cdr1_compat(structdef)
-    name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr1_compat")
+# Shared implementation for `@cdr_fixed` (and its deprecated alias
+# `@cdr1_compat`). `macroname` is woven into error/assert messages so the
+# diagnostics name whichever spelling the caller used.
+function _cdr_fixed_impl(structdef, __module__, macroname::AbstractString)
+    name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, macroname)
 
     f_types = Type[Base.eval(__module__, te) for te in f_type_exprs]
     for (i, T) in enumerate(f_types)
         _is_cdr1_compat_type(T) ||
-            error("@cdr1_compat: field $(f_names[i])::$T is not CDR1-flat-compatible " *
-                  "(must be a primitive, an SArray of primitives, or another flat " *
-                  "CDR1-compatible struct). Variable-length fields are not supported; " *
-                  "use @cdr_compact's CDRString/CDRArray view mode or read them through " *
-                  "the generic path.")
+            error("$macroname: field $(f_names[i])::$T is not fixed-size " *
+                  "(must be a primitive, an SArray of primitives, or another fixed-size " *
+                  "struct). Variable-length fields are not supported; declare them with " *
+                  "`@cdr_view` (CDRString/CDRArray fields) or read them through the generic path.")
     end
 
     field_exprs     = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
     companions      = _cdr1_emit_companions(name_sym, f_names)
-    compat_qual     = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
+    fixed_qual      = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
     write_value_qual = GlobalRef(@__MODULE__, :_write_value)
     cdrwriter_qual  = GlobalRef(@__MODULE__, :CDRWriter)
 
@@ -333,9 +299,62 @@ macro cdr1_compat(structdef)
             return position(_c) - _p0
         end
 
-        @assert isbitstype($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not isbits"
-        @assert $compat_qual($name_sym) "@cdr1_compat: $($(QuoteNode(name_sym))) is not CDR1-flat-compatible"
+        @assert isbitstype($name_sym) string($macroname, ": ", $(QuoteNode(name_sym)), " is not isbits")
+        @assert $fixed_qual($name_sym) string($macroname, ": ", $(QuoteNode(name_sym)), " is not fixed-size")
     end)
+end
+
+"""
+    @cdr_fixed struct Name
+        field1::T1
+        ...
+    end
+
+Define a plain, single concrete **fixed-size** struct whose serialization is
+**standard CDR1 / XCDR1** — byte-for-byte what a conventional CDR producer
+(e.g. a ROS 2 publisher) emits, including *omitting trailing pad*. "Fixed-size"
+is the guarantee: every field has a constant compile-time wire size, so a
+sequence of these is [`CDRArrayView`](@ref)-able. Unlike [`@cdr_compact`] this
+emits exactly one type (no `Name{V}` variant union, no padded inner structs),
+so values nest and embed cleanly in other types.
+
+Field types must be primitives, `SArray`s of primitives, or other fixed-size
+`@cdr_fixed` structs (nesting is allowed and validated recursively).
+Variable-length fields (`String`, `Vector`, `CDRString`, `CDRArray`) are
+rejected — they aren't fixed-size; declare a [`@cdr_view`](@ref) struct (with
+`CDRString`/`CDRArray` fields) or read them through the generic path.
+
+Aside from a `write(c, v)` forwarder, no custom serialization hooks are
+generated: the value flows through the normal field-walk `read`/`write`
+machinery, which resolves CDR1 offsets at compile time. A struct that ends on
+its maximum alignment also qualifies for the single-store fast path. Either way
+the wire bytes are standard CDR1 with no trailing pad.
+
+The CDR1 wire-compatibility guarantee is for CDR1/XCDR1. The same type still
+encodes correctly under XCDR2 (8-byte primitives are realigned to 4 via
+per-field flattening), but XCDR2 is not this macro's promise.
+
+Being `@cdr_fixed` puts the type in the **fixed** tier. Whether it *also* reaches
+the **compact** tier — reads/writes as a single load/store and is zero-copy
+[`CDRArray`](@ref)-aliasable — depends on its layout (it must lead with its
+widest-aligned field and have no trailing pad) and this macro does **not**
+guarantee it. Call [`cdr_layout`](@ref)`(T)` (or [`iscompact`](@ref)`(T)`) to see
+which tier your type lands in and why.
+"""
+macro cdr_fixed(structdef)
+    return _cdr_fixed_impl(structdef, __module__, "@cdr_fixed")
+end
+
+"""
+    @cdr1_compat struct Name … end
+
+Deprecated alias for [`@cdr_fixed`](@ref) — identical behaviour. Prefer
+`@cdr_fixed`, whose name reflects the actual guarantee (a fixed-size struct).
+"""
+macro cdr1_compat(structdef)
+    Base.depwarn("`@cdr1_compat` is deprecated, use `@cdr_fixed` (identical behaviour).",
+                 Symbol("@cdr1_compat"))
+    return _cdr_fixed_impl(structdef, __module__, "@cdr1_compat")
 end
 
 """
@@ -347,13 +366,13 @@ end
 Define a struct carrying **both** a CDR1 and an XCDR2 layout, behind a public
 wrapper `Name{V}` parameterised on variant. Use this only when one value must
 be serializable under either encoding; **if you only need CDR1/XCDR1, prefer
-[`@cdr1_compat`]** — it emits a single plain concrete type that nests cleanly
+[`@cdr_fixed`]** — it emits a single plain concrete type that nests cleanly
 and has no variant union.
 
 The macro emits:
 
   * `_Name_CDR1` — a flat plain struct of the natural field types (identical to
-    what [`@cdr1_compat`] produces). It serializes as **standard CDR1 with no
+    what [`@cdr_fixed`] produces). It serializes as **standard CDR1 with no
     trailing pad**; a struct that ends on its max alignment additionally takes
     the single-store fast path.
   * `_Name_CDR2` — 8-byte primitives (and SArrays thereof) substituted with
@@ -386,10 +405,12 @@ inner CDR1/CDR2 types land in the single-load/`CDRArray`-viewable tier, call
 macro cdr_compact(structdef)
     name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr_compact")
 
-    # Opt-in view mode: if any field is declared `CDRString` or
-    # `CDRArray{Element}`, emit a buffer-backed view struct read zero-copy.
-    # Plain fields are never silently turned into views.
+    # Deprecated view mode: if any field is declared `CDRString`/`CDRArray`,
+    # this used to emit a buffer-backed view struct. That capability now lives
+    # in `@cdr_view`; forward to it (with a depwarn) for backwards compatibility.
     if _cdr_has_view_fields(f_type_exprs)
+        Base.depwarn("`@cdr_compact` view mode (CDRString/CDRArray fields) is deprecated, " *
+                     "use `@cdr_view`.", Symbol("@cdr_compact"))
         return _cdr_view_emit(name_sym, f_names, f_type_exprs)
     end
 
@@ -555,4 +576,29 @@ macro cdr_compact(structdef)
         @assert sizeof($inner2) == $cdr2_julia_size "@cdr_compact: CDR2 sizeof mismatch for $($(QuoteNode(inner2)))"
         @assert $struct_size_qual($inner2, true) == sizeof($inner2) "@cdr_compact: CDR2 layout helpers disagree for $($(QuoteNode(inner2)))"
     end)
+end
+
+"""
+    @cdr_view struct Name
+        field1::CDRString
+        field2::CDRArray{Element}
+        field3::T            # plain field — read as an owned value
+        ...
+    end
+
+Define a **buffer-backed zero-copy view struct**: a `Name{S}` parameterised on
+the backing byte buffer, where fields declared `CDRString` / `CDRArray{Element}`
+are read as views aliasing the reader's buffer (no copy), and any other field is
+read as an ordinary owned value. `read(r, Name)` (and the `view(r, Name)` alias)
+decode the fields in declaration order over an IOBuffer-/MemBuf-backed reader.
+
+This is orthogonal to storage compactness — it's about *aliasing* a message's
+variable-length payload in place rather than copying it. For a struct of
+fixed-size values use [`@cdr_fixed`]; for the single-store CDR1+XCDR2 blob use
+[`@cdr_compact`]; for a lazy, nominal view of an ordinary struct use
+[`read_view`](@ref) → [`CDRView`](@ref).
+"""
+macro cdr_view(structdef)
+    name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr_view")
+    return _cdr_view_emit(name_sym, f_names, f_type_exprs)
 end
