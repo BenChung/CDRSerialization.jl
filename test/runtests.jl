@@ -733,6 +733,242 @@ end
     @test read(r, UInt16)  == 123
 end
 
+# A flat-but-non-compact struct: UInt16, then Float64 (8-aligned), then UInt16.
+# Julia pads it to 24 bytes; standard CDR is 18 with the field at offset 0.
+struct _AwkwardMsg
+    a::UInt16
+    b::Float64
+    c::UInt16
+end
+Base.:(==)(x::_AwkwardMsg, y::_AwkwardMsg) = x.a == y.a && x.b == y.b && x.c == y.c
+
+@testset "generic write(c, struct) is the inverse of read(r, T)" begin
+    # Owned struct write — no write_all!, no hand-rolled field statements.
+    pose = _TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.1, 0.2, 0.3, 0.4))
+    named = _TestNamedPose("base_link", pose)
+    for (v, T) in ((pose, _TestPose), (named, _TestNamedPose))
+        data = IOBuffer()
+        w = CDRSerialization.CDRWriter(data)
+        n = write(w, v)
+        @test n == position(w) - 4          # byte count includes padding
+        seekstart(data)
+        @test read(CDRSerialization.CDRReader(data), T) == v
+    end
+
+    # Generic struct write produces the same bytes as write_all! when the value
+    # starts at the (max-aligned) message origin.
+    d1 = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(d1), named)
+    d2 = IOBuffer(); write(CDRSerialization.CDRWriter(d2), named)
+    @test take!(d1) == take!(d2)
+end
+
+@testset "generic write aligns each field independently (no over-pad)" begin
+    # Written right after a string the struct lands at a 4-aligned (not
+    # 8-aligned) offset. The field-walk writer pads `b` to the next 8 *within*
+    # the struct — exactly what the field-walk reader expects. (A single
+    # write_all! packed run would instead pad the whole struct to 8 up front,
+    # desyncing the reader — the latent bug this path avoids.)
+    msg = _AwkwardMsg(0x1111, 3.14, 0x2222)
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, "hi")        # leaves the cursor at a non-8-aligned offset
+    write(w, msg)
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, String) == "hi"
+    @test read(r, _AwkwardMsg) == msg
+
+    # Size calculator agrees with the field-walk writer for the whole message.
+    calc = CDRSizeCalculator()
+    CDRSerialization.addValue!(calc, "hi")
+    CDRSerialization.addValue!(calc, msg)
+    @test position(calc) == position(w)
+end
+
+# A struct leading with a smaller-aligned field than its max. Its CDR data size
+# equals its Julia sizeof (no trailing pad), so the old compactness test would
+# have single-blob it — but the blob's internal padding is baked for an
+# 8-aligned base, so it can't sit where a field-walk reader puts it at a
+# 2-aligned offset. It must field-walk; `iscompact` must report that.
+struct _LeadSmall
+    a::UInt16
+    b::Float64
+end
+Base.:(==)(x::_LeadSmall, y::_LeadSmall) = x.a == y.a && x.b == y.b
+
+@testset "compact fast path is restricted to standard-CDR-safe structs" begin
+    # Not single-blob compact, despite sizeof == cdr-data-size, because it leads
+    # with a 2-aligned field under an 8-aligned struct.
+    @test !CDRSerialization.iscompact(_LeadSmall)
+    @test CDRSerialization._struct_cdr_size(_LeadSmall, false) == sizeof(_LeadSmall)
+
+    # Reading hand-written STANDARD-CDR bytes (a at +2, b at +8) matches a
+    # field-walk reader — the blob path would have skipped a to +8.
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, UInt16(0x1234))     # prefix @0
+    write(w, UInt16(0xAAAA))     # _LeadSmall.a @2 (standard placement)
+    write(w, Float64(3.14))      # _LeadSmall.b @8
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, UInt16) == 0x1234
+    @test read(r, _LeadSmall) == _LeadSmall(0xAAAA, 3.14)
+
+    # And our own generic write lands it at the standard offsets (a@2, b@8).
+    d2 = IOBuffer()
+    w2 = CDRSerialization.CDRWriter(d2)
+    write(w2, UInt16(0x1234))
+    write(w2, _LeadSmall(0xAAAA, 3.14))
+    @test position(w2) == 4 + 16     # u16@0, a@2, b@8, ends @16
+    seekstart(d2)
+    r2 = CDRSerialization.CDRReader(d2)
+    @test read(r2, UInt16) == 0x1234
+    @test read(r2, _LeadSmall) == _LeadSmall(0xAAAA, 3.14)
+
+    # A struct that leads with its max-aligned field is still single-blob.
+    @test CDRSerialization.iscompact(_TestPoint)   # {Float64,Float64,Float64}
+end
+
+@testset "generic write(c, Vector{Struct}) length-prefixes (inverse of read)" begin
+    poses = [_TestPose(_TestPoint(1.0, 2.0, 3.0), _TestQuat(0.0, 0.0, 0.0, 1.0)),
+             _TestPose(_TestPoint(4.0, 5.0, 6.0), _TestQuat(0.7, 0.0, 0.7, 0.0))]
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, poses)                          # default: writes u32 length prefix
+    seekstart(data)
+    r = CDRSerialization.CDRReader(data)
+    @test read(r, Vector{_TestPose}) == poses
+
+    # SVector of structs: fixed length, no prefix (inverse of the SArray read).
+    triplet = SVector(poses[1], poses[2], poses[1])
+    d2 = IOBuffer()
+    w2 = CDRSerialization.CDRWriter(d2)
+    write(w2, triplet)
+    seekstart(d2)
+    @test read(CDRSerialization.CDRReader(d2), typeof(triplet)) == triplet
+end
+
+@testset "write_all! packed runs stay field-walk-correct at non-max-aligned offsets" begin
+    # A run is aligned to its widest member, but the reader aligns the run's
+    # first leaf to its own alignment. When a run leads with a narrower-aligned
+    # leaf and starts off a max-aligned boundary (e.g. right after a string),
+    # the two must still agree — the grouping splits the run so they do.
+    rt(args, reads) = begin
+        data = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(data), args...)
+        seekstart(data); r = CDRSerialization.CDRReader(data)
+        Tuple(rd(r) for rd in reads)
+    end
+    @test rt((UInt16(0xAAAA), 3.14),
+             (r->read(r,UInt16), r->read(r,Float64))) == (0xAAAA, 3.14)
+    @test rt(("s", UInt16(0xAAAA), 3.14),
+             (r->read(r,String), r->read(r,UInt16), r->read(r,Float64))) == ("s", 0xAAAA, 3.14)
+    @test rt(("s", UInt8(1), UInt32(2), UInt16(3)),
+             (r->read(r,String), r->read(r,UInt8), r->read(r,UInt32), r->read(r,UInt16))) == ("s", 0x01, UInt32(2), 0x0003)
+
+    # write_all! and the generic field-walk write must emit identical bytes.
+    d1 = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(d1), "s", _LeadSmall(0xAAAA, 3.14))
+    d2 = IOBuffer(); w = CDRSerialization.CDRWriter(d2); write(w, "s"); write(w, _LeadSmall(0xAAAA, 3.14))
+    @test take!(d1) == take!(d2)
+
+    # Vector of a non-compact (lead-with-small) struct round-trips through
+    # write_all! + the field-walk reader.
+    msgs = [_LeadSmall(0x1111, 1.0), _LeadSmall(0x2222, 2.0), _LeadSmall(0x3333, 3.0)]
+    data = IOBuffer(); CDRSerialization.write_all!(CDRSerialization.CDRWriter(data), msgs)
+    seekstart(data)
+    @test read(CDRSerialization.CDRReader(data), Vector{_LeadSmall}) == msgs
+end
+
+@testset "cdr_layout surfaces the capability tier + reason" begin
+    # compact (leads with max-align field, no trailing pad): all capabilities.
+    lc = cdr_layout(_TestPoint)
+    @test lc.fixed_size && lc.single_op && lc.viewable
+    @test lc isa CDRLayout
+
+    # flat but trailing pad → fixed-size, but not single-op / viewable.
+    lp = cdr_layout(_C1Pad)                       # {Float64; UInt8}, from earlier testset
+    @test lp.fixed_size && !lp.single_op && !lp.viewable
+    @test occursin("trailing padding", lp.why)
+
+    # flat but leads with a narrow field → fixed-size, not single-op / viewable.
+    ln = cdr_layout(_LeadSmall)                    # {UInt16; Float64}
+    @test ln.fixed_size && !ln.single_op && !ln.viewable
+    @test occursin("leads with", ln.why)
+
+    # dynamic (has a String/Vector) → none of the three.
+    ld = cdr_layout(_TestInner)                    # {String; Vector{Float64}}
+    @test !ld.fixed_size && !ld.single_op && !ld.viewable
+    @test occursin("variable-length", ld.why)
+
+    # the nesting holds: viewable ⟹ single_op ⟹ fixed_size for each.
+    for T in (_TestPoint, _C1Pad, _LeadSmall, _TestInner, Float64)
+        l = cdr_layout(T)
+        @test !l.viewable || l.single_op
+        @test !l.single_op || l.fixed_size
+    end
+
+    # cdr_layout agrees with the iscompact predicate.
+    @test cdr_layout(_TestPoint).single_op == CDRSerialization.iscompact(_TestPoint)
+    @test cdr_layout(_LeadSmall).single_op == CDRSerialization.iscompact(_LeadSmall)
+end
+
+@testset "view error message explains why and points to the owned read" begin
+    mem = Memory{UInt8}(undef, 128)
+    CDRSerialization.write_all!(CDRSerialization.CDRWriter(mem), [_LeadSmall(0x1, 1.0)])
+    r = CDRSerialization.CDRReader(mem)
+    err = try; view(r, CDRArray{_LeadSmall}); catch e; e; end
+    @test err isa ArgumentError
+    @test occursin("leads with", err.msg)            # the reason
+    @test occursin("read(r, Vector{", err.msg)       # the suggested alternative
+end
+
+@testset "CDRArray view of a @cdr1_compat element: only when compact" begin
+    # _LeadSmall is standard-CDR1 but NOT compact (leads with UInt16 < max 8):
+    # its sequence elements aren't uniformly strided, so they can't be aliased.
+    mem = Memory{UInt8}(undef, 256)
+    CDRSerialization.write_all!(CDRSerialization.CDRWriter(mem),
+                               [_LeadSmall(0x1111, 1.0), _LeadSmall(0x2222, 2.0)])
+    r = CDRSerialization.CDRReader(mem)
+    @test !CDRSerialization.canview(r, CDRArray{_LeadSmall})
+    @test_throws ArgumentError view(r, CDRArray{_LeadSmall})
+    # The owned read still works.
+    @test read(CDRSerialization.CDRReader(mem), Vector{_LeadSmall}) ==
+          [_LeadSmall(0x1111, 1.0), _LeadSmall(0x2222, 2.0)]
+
+    # A compact element (leads with max-align field) IS viewable.
+    mem2 = Memory{UInt8}(undef, 256)
+    pts = [_TestPoint(1.0, 2.0, 3.0), _TestPoint(4.0, 5.0, 6.0)]
+    CDRSerialization.write_all!(CDRSerialization.CDRWriter(mem2), pts)
+    r2 = CDRSerialization.CDRReader(mem2)
+    @test CDRSerialization.canview(r2, CDRArray{_TestPoint})
+    @test view(r2, CDRArray{_TestPoint}) == pts
+end
+
+@testset "write(c, vector) default length-prefix is symmetric with read" begin
+    # A bare `write(c, vec)` (no explicit writeLength) writes the u32 length
+    # prefix, exactly as `read(r, Vector{T})` consumes it and the size
+    # calculator counts it — for every dynamic sequence element type.
+    for v in (Float64[1.0, 2.0, 3.0], UInt8[1, 2, 3], Int16[-1, 2, -3],
+              ["foo", "barbaz"], [_TestPoint(1.0, 2.0, 3.0), _TestPoint(4.0, 5.0, 6.0)])
+        data = IOBuffer()
+        w = CDRSerialization.CDRWriter(data)
+        write(w, v)                                   # default → writes prefix
+        seekstart(data)
+        r = CDRSerialization.CDRReader(data)
+        @test read(r, Vector{eltype(v)}) == v
+
+        calc = CDRSizeCalculator()
+        CDRSerialization.addValue!(calc, v)           # default → counts prefix
+        @test position(calc) == position(w)
+    end
+
+    # A fixed-length SArray still carries NO prefix by default (both ends agree).
+    data = IOBuffer()
+    w = CDRSerialization.CDRWriter(data)
+    write(w, SVector(1.0, 2.0, 3.0))
+    seekstart(data)
+    @test read(CDRSerialization.CDRReader(data), SVector{3, Float64}) == [1.0, 2.0, 3.0]
+end
+
 @testset "AllocCheck" begin
     include("alloc_check.jl")
 end

@@ -124,6 +124,9 @@ _write_named(w, n)       = CDRSerialization.write_all!(w, n)
 _write_pose_vec(w, v)    = CDRSerialization.write_all!(w, v)
 _calc_value(c, v)        = CDRSerialization.addValue!(c, v)
 _read_pose(r)            = read(r, _AllocPose)
+_gwrite_pose(w, p)       = write(w, p)
+_gwrite_named(w, n)      = write(w, n)
+_gwrite_pose_vec(w, v)   = write(w, v)
 
 @testset "AllocCheck: nested struct writes" begin
     # Packed nested struct → fully flat unsafe_store chain, no allocations.
@@ -136,6 +139,14 @@ _read_pose(r)            = read(r, _AllocPose)
 
     # Vector{Struct}: writes length prefix + N inline structs.
     @test isempty(_allocs(_write_pose_vec, (_WriterT, Vector{_AllocPose})))
+end
+
+@testset "AllocCheck: generic write(c, struct) / write(c, Vector)" begin
+    # Compact struct → single-store fast path; non-compact-with-String → field
+    # walk; Vector{Struct} → length prefix + per-element walk. All alloc-free.
+    @test isempty(_allocs(_gwrite_pose, (_WriterT, _AllocPose)))
+    @test isempty(_allocs(_gwrite_named, (_WriterT, _AllocNamedPose)))
+    @test isempty(_allocs(_gwrite_pose_vec, (_WriterT, Vector{_AllocPose})))
 end
 
 @testset "AllocCheck: compact struct read" begin

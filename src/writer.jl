@@ -284,7 +284,12 @@ end
     return nothing
 end
 
-function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=false) where T <: Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}
+# Dynamic sequence: `writeLength` defaults to `true` — the u32 length prefix is
+# part of a CDR sequence and the reader (`read(r, Vector{T})`) and size
+# calculator both assume it. Pass `false` only when emitting a bare element run
+# whose count the caller writes separately. (The fixed-length `SArray` methods
+# below default to `false`: an `SArray` is a CDR array, which carries no prefix.)
+function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=true) where T <: Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32}
     if writeLength
         sequenceLength(w, length(a))
     end
@@ -303,7 +308,7 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where {T <: Union{Int
     return nothing
 end
 
-function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=false) where T <: Union{Int64, UInt64, Float64}
+function Base.write(w::CDRWriter, a::AbstractArray{T}, writeLength=true) where T <: Union{Int64, UInt64, Float64}
     if writeLength
         sequenceLength(w, length(a))
     end
@@ -322,13 +327,115 @@ function Base.write(w::CDRWriter, a::A, writeLength=false) where {T <: Union{Int
     return nothing
 end
 
-function Base.write(w::CDRWriter, a::A, writeLength=false) where A<:AbstractArray{String}
+function Base.write(w::CDRWriter, a::A, writeLength=true) where A<:AbstractArray{String}
     if writeLength
         sequenceLength(w, length(a))
     end
     for s in a
         write(w, s)
     end
+end
+
+# --- Generic struct / sequence writes ---------------------------------------
+#
+# These are the exact inverse of the generic reads (`_read_value` /
+# `_read_user_struct` and `read(r, Vector{T})` / `read(r, ::Type{SArray})`):
+# each struct field is written at its own CDR alignment relative to the message
+# origin — NOT packed to the struct's widest member the way a single `write_all!`
+# run does. That field-independent alignment is what guarantees a flat-but-non-
+# compact struct embedded at an arbitrary offset round-trips through the field-
+# walk reader. A genuinely compact struct still takes the single-`unsafe_store!`
+# fast path, which is bit-identical to the field walk.
+
+# Compact-struct fast path: one wide store of the whole value (mirror of
+# `_read_struct_compact`). The caller guarantees compactness via
+# `_is_compact_struct`.
+@generated function _write_struct_compact(c::C, x::T) where {C <: CDRWriter, T}
+    isCDR2 = C.parameters[1]
+    max_align = _wa_align_for(T, isCDR2)
+    sz = sizeof(T)
+    return quote
+        align(c, $max_align)
+        buf = c.buf
+        _ensureroom!(buf, $sz)
+        data = _buf_data(buf)
+        ptr = _buf_pos(buf)
+        GC.@preserve data unsafe_store!(Ptr{$T}(pointer(data, ptr)), x)
+        new_ptr = ptr + $sz
+        if new_ptr - 1 > _buf_size(buf)
+            _buf_size!(buf, new_ptr - 1)
+        end
+        _buf_pos!(buf, new_ptr)
+        return nothing
+    end
+end
+
+# Field-walk write: each field through its own `write`, the inverse of
+# `_read_user_struct`. Array fields carry the same length-prefix convention the
+# reader assumes — dynamic sequences (`Vector`) are length-prefixed, fixed-length
+# `SArray`s are not — so a field whose `write` defaults to no prefix (the
+# primitive/string array methods) is still given one here.
+@generated function _write_user_struct(c::CDRWriter, x::T) where T
+    if isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0
+        stmts = Expr[]
+        for i in 1:fieldcount(T)
+            FT = fieldtype(T, i)
+            fv = :(getfield(x, $i))
+            if FT <: SArray
+                push!(stmts, :(write(c, $fv)))        # fixed-length, no prefix
+            elseif FT <: AbstractArray
+                push!(stmts, :(write(c, $fv, true)))  # dynamic sequence, length prefix
+            else
+                push!(stmts, :(write(c, $fv)))        # scalar / String / nested struct
+            end
+        end
+        push!(stmts, :(return nothing))
+        return Expr(:block, stmts...)
+    end
+    return :(throw(ArgumentError(string("write: unsupported type ", $T))))
+end
+
+@generated function _write_value(c::C, x::T) where {C <: CDRWriter, T}
+    isCDR2 = C.parameters[1]
+    LE     = C.parameters[2]
+    if _is_compact_struct(T, isCDR2, LE)
+        return :(_write_struct_compact(c, x))
+    end
+    return :(_write_user_struct(c, x))
+end
+
+# Generic single-value catch-all (mirror of `read(r, ::Type{T})`). Returns the
+# byte count — including alignment padding — as `Base.write` callers expect. The
+# primitive / String / array / SArray methods above are all more specific, so
+# this only fires for user structs (and anything else falls through to the
+# `_write_user_struct` error).
+function Base.write(c::CDRWriter, x::T) where T
+    p0 = position(c)
+    _write_value(c, x)
+    return position(c) - p0
+end
+
+# Sequence of non-primitive elements: u32 length prefix then each element through
+# its own `write` (mirror of `read(r, Vector{T})` for non-primitive `T`). Unlike
+# the primitive-element array methods — whose `writeLength` defaults to `false`
+# because `write_all!` manages their prefixes — this defaults to `true` so a bare
+# `write(c, vec_of_struct)` is the inverse of the reader, which reads the prefix
+# by default.
+function Base.write(c::CDRWriter, a::AbstractArray{T}, writeLength=true) where T
+    writeLength && sequenceLength(c, length(a))
+    for elt in a
+        write(c, elt)
+    end
+    return nothing
+end
+
+# SArray of non-primitive elements: fixed-length, no prefix (mirror of
+# `read(r, ::Type{SArray})` for non-primitive elements).
+function Base.write(c::CDRWriter, a::SArray{S, T, N, L}) where {S, T, N, L}
+    for elt in a
+        write(c, elt)
+    end
+    return nothing
 end
 
 # Unchecked variants used by `write_all!` after a single upfront ensureroom.
@@ -746,10 +853,20 @@ function _wa_mixed_body(types::Vector, isCDR2::Bool, LE::Bool, value_expr::Funct
     while i <= n
         T = exp_types[i]
         # Pack leaves and compact structs into a single run — both flow
-        # through `_wa_packed_run_expr` with constant-offset stores.
+        # through `_wa_packed_run_expr` with constant-offset stores. A run
+        # aligns its start to its widest member; the field-walk reader instead
+        # aligns the run's *first* leaf to its own alignment. Those agree only
+        # when the first leaf carries the run's max alignment — so a run may
+        # not extend across a leaf wider-aligned than its head (that leaf
+        # starts a new run). Otherwise a run placed at a non-max-aligned offset
+        # (e.g. right after a string) would over-pad its head and desync the
+        # reader. At the message origin (offset 0, aligned to everything) the
+        # grouping is immaterial; this only changes non-origin runs.
         if _is_packed_leaf(T) || _is_compact_struct(T, isCDR2, LE)
-            j = i
-            while j <= n && (_is_packed_leaf(exp_types[j]) || _is_compact_struct(exp_types[j], isCDR2, LE))
+            run_align = _wa_align_for(T, isCDR2)
+            j = i + 1
+            while j <= n && (_is_packed_leaf(exp_types[j]) || _is_compact_struct(exp_types[j], isCDR2, LE)) &&
+                  _wa_align_for(exp_types[j], isCDR2) <= run_align
                 j += 1
             end
             push!(body, _wa_packed_run_expr(exp_types[i:j-1], exp_exprs[i:j-1], isCDR2, LE))

@@ -1,5 +1,5 @@
 using CDRSerialization: CDRReader, CDRWriter, write_all!, reinterpret_struct, reinterpret_array,
-                        reinterpret_string, read_view, CDRString, canview, iscompact
+                        reinterpret_string, read_view, CDRString, CDRView, CDRArrayView, canview, iscompact
 using CDRSerialization
 using StaticArrays
 using AllocCheck
@@ -183,7 +183,7 @@ end
     v = read_view(CDRReader(mem), _ROuter)
     @test v.name isa CDRArray{UInt8}
     @test collect(v.name) == UInt8[0x61, 0x62, 0x63]
-    @test v.frame isa NamedTuple              # nested view
+    @test v.frame isa CDRView                 # nested view
     @test v.frame.id == 3
     @test v.frame.poses isa CDRArray{_RPoint}
     @test v.frame.poses[1] == _RPoint(1.0, 2.0, 3.0)
@@ -201,6 +201,104 @@ end
     @test v.n == 5
     @test v.labels isa Vector{String}
     @test v.labels == ["foo", "bar"]
+end
+
+@testset "CDRView: nominal type — dispatch, propertynames, ==, show" begin
+    frame = _RFrame(7, [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0)],
+                    [10.0, 20.0, 30.0], 99.5)
+    mem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(mem), frame)
+
+    v = read_view(CDRReader(mem), _RFrame)
+    # Nominal & dispatchable on the source struct type (not a bare NamedTuple).
+    @test v isa CDRView{_RFrame}
+    @test !(v isa NamedTuple)
+    @test propertynames(v) == fieldnames(_RFrame)
+
+    # View == owned struct of the same values, and == another view, both ways.
+    @test v == frame
+    @test frame == v
+    v2 = read_view(CDRReader(mem), _RFrame)
+    @test v == v2
+    # Inequality is detected field-wise.
+    @test !(v == _RFrame(8, frame.poses, frame.samples, frame.timestamp))
+
+    # `view(r, T)` is an alias of `read_view(r, T)` for a plain struct.
+    @test view(CDRReader(mem), _RFrame) == v
+
+    @test occursin("CDRView", sprint(show, v))
+end
+
+@testset "CDRView: nested view compares equal to owned nested struct" begin
+    frame = _RFrame(3, [_RPoint(1.0, 2.0, 3.0)], Float64[], 1.0)
+    outer = _ROuter(UInt8[0x61, 0x62, 0x63], frame, 0xBEEF)
+    mem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(mem), outer)
+
+    v = read_view(CDRReader(mem), _ROuter)
+    @test v isa CDRView{_ROuter}
+    @test v.frame isa CDRView{_RFrame}
+    @test v.frame == frame                # nested CDRView == nested owned struct
+    @test v == outer                      # whole view == whole owned struct
+end
+
+# A flat fixed-size struct that is NOT compact (leads with UInt16 < max align 8).
+# Its sequence can't be a zero-copy CDRArray, but it CAN be a decoding CDRArrayView.
+struct _RLead
+    a::UInt16
+    b::Float64
+end
+Base.:(==)(x::_RLead, y::_RLead) = x.a == y.a && x.b == y.b
+
+@testset "CDRArrayView: decoding view over a flat non-compact element" begin
+    leads = [_RLead(UInt16(i), Float64(i) * 1.5) for i in 1:9]
+    mem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(mem), leads)
+
+    av = view(CDRReader(mem), CDRArrayView{_RLead})
+    @test av isa CDRArrayView{_RLead}
+    @test av isa AbstractVector{_RLead}
+    @test length(av) == 9
+    @test av == leads                              # value-equal to owned
+    @test av[1] == leads[1]                        # the phase-shifted first element
+    @test av[5] == leads[5]                        # a steady-stride element (random access)
+    @test collect(av) == read(CDRReader(mem), Vector{_RLead})
+
+    # Not aliasable as a CDRArray (not compact), but IS CDRArrayView-able.
+    @test !canview(CDRReader(mem), CDRArray{_RLead})
+    @test canview(CDRReader(mem), CDRArrayView{_RLead})
+    @test !iscompact(_RLead)
+
+    # Cursor advances past the whole sequence — a trailing field reads correctly.
+    mem2 = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(mem2), leads, UInt32(0xDEADBEEF))
+    r2 = CDRReader(mem2)
+    view(r2, CDRArrayView{_RLead})
+    @test read(r2, UInt32) == 0xDEADBEEF
+end
+
+@testset "CDRArrayView: getindex is allocation-free after warmup" begin
+    leads = [_RLead(UInt16(i), Float64(i)) for i in 1:32]
+    mem = Memory{UInt8}(undef, 2048)
+    write_all!(CDRWriter(mem), leads)
+    av = view(CDRReader(mem), CDRArrayView{_RLead})
+    s(a) = (t = 0.0; for x in a; t += x.b; end; t)
+    s(av)                                          # warmup
+    @test (@allocated s(av)) == 0
+end
+
+@testset "read_view routes sequence fields by element tier" begin
+    # compact element → CDRArray (alias); flat-noncompact → CDRArrayView (decode);
+    # variable-length element → owned Vector.
+    leads = [_RLead(UInt16(1), 1.0), _RLead(UInt16(2), 2.0)]
+    pts = [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0)]
+    mem = Memory{UInt8}(undef, 1024)
+    # struct: id, compact-seq, flat-noncompact-seq
+    write_all!(CDRWriter(mem), UInt32(7), pts, leads)
+    r = CDRReader(mem)
+    @test read(r, UInt32) == 7
+    @test view(r, CDRArray{_RPoint}) == pts        # compact path
+    @test view(r, CDRArrayView{_RLead}) == leads   # decoding path
 end
 
 @testset "reinterpret_string: zero-copy UTF-8 view" begin
@@ -249,6 +347,56 @@ end
     @test v.id == 7
     @test v.samples isa CDRArray{Float64}
     @test collect(v.samples) == [1.0, 2.0, 3.0]
+end
+
+@testset "materialize: copy a CDRView out to an owned, de-aliased value" begin
+    # Leaves convert + the catch-all leaves owned values untouched.
+    lmem = Memory{UInt8}(undef, 256)
+    write_all!(CDRWriter(lmem), "robot", [1.0, 2.0, 3.0])
+    lr = CDRReader(lmem)
+    @test materialize(view(lr, CDRString))::String == "robot"
+    @test materialize(view(lr, CDRArray{Float64}))::Vector{Float64} == [1.0, 2.0, 3.0]
+    @test materialize(42) === 42
+
+    # A struct's CDRArray fields become owned Vectors; the result aliases nothing.
+    frame = _RFrame(7, [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0)],
+                    [10.0, 20.0, 30.0], 99.5)
+    fmem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(fmem), frame)
+
+    m = materialize(read_view(CDRReader(fmem), _RFrame))
+    @test m isa _RFrame
+    @test m.poses isa Vector{_RPoint} && m.samples isa Vector{Float64}
+    @test read_view(CDRReader(fmem), _RFrame) == m          # view value-equals the copy
+    @test convert(_RFrame, read_view(CDRReader(fmem), _RFrame)) isa _RFrame   # convert(T, v) alias
+
+    fill!(fmem, 0xFF)                                       # scribble the source buffer
+    @test m.poses == [_RPoint(1.0, 2.0, 3.0), _RPoint(4.0, 5.0, 6.0)]
+    @test m.samples == [10.0, 20.0, 30.0]
+    @test m.id == 7 && m.timestamp == 99.5                 # owned copy is unaffected
+end
+
+@testset "materialize: recurses nested views + the CDRArrayView rung" begin
+    # Nested dynamic struct → nested CDRView → owned struct.
+    outer = _ROuter(UInt8[0x61, 0x62, 0x63],
+                    _RFrame(3, [_RPoint(1.0, 2.0, 3.0)], Float64[], 1.0), 0xBEEF)
+    omem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(omem), outer)
+
+    m = materialize(read_view(CDRReader(omem), _ROuter))
+    fill!(omem, 0x00)
+    @test m isa _ROuter
+    @test m.name isa Vector{UInt8} && m.name == UInt8[0x61, 0x62, 0x63]
+    @test m.frame isa _RFrame && m.frame.id == 3 && m.frame.poses == [_RPoint(1.0, 2.0, 3.0)]
+    @test m.tail == 0xBEEF
+
+    # Flat-but-non-compact sequence element → CDRArrayView → owned Vector.
+    leads = [_RLead(UInt16(i), Float64(i) * 1.5) for i in 1:9]
+    vmem = Memory{UInt8}(undef, 512)
+    write_all!(CDRWriter(vmem), leads)
+    mv = materialize(view(CDRReader(vmem), CDRArrayView{_RLead}))
+    fill!(vmem, 0x00)
+    @test mv isa Vector{_RLead} && mv == leads
 end
 
 # @cdr_compact opt-in view mode: only fields declared CDRString / CDRArray{T}

@@ -10,6 +10,7 @@ include("sizecalculator.jl")
 include("reinterpret.jl")
 export CDRReader, CDRWriter, CDRSizeCalculator, @cdr_compact, @cdr1_compat,
        reinterpret_struct, reinterpret_array, reinterpret_string, read_view,
-       canview, iscompact, CDRArray, CDRString
+       canview, iscompact, cdr_layout, CDRLayout, CDRArray, CDRArrayView, CDRString, CDRView,
+       materialize
 
 end # module CDR

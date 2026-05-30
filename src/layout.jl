@@ -82,11 +82,26 @@ function _struct_cdr_size(::Type{T}, isCDR2::Bool=false) where T
     return -1
 end
 
+# Alignment the field-walk reader applies to the very first thing it reads out
+# of `T` — its leftmost leaf (recursing through nested structs; an SArray is a
+# leaf). This is what decides whether the single-blob path can sit at an
+# arbitrary offset; see `_is_compact_struct`.
+function _first_leaf_align(::Type{T}, isCDR2::Bool) where T
+    if T <: SArray
+        return _wa_align_for(T, isCDR2)
+    end
+    if isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0
+        return _first_leaf_align(fieldtype(T, 1), isCDR2)
+    end
+    return _wa_align_for(T, isCDR2)
+end
+
 # A "compact" struct can flow through a single `unsafe_store!`/`unsafe_load`
 # instead of per-field stores. Requires:
 #   * isbits with no trailing pad (Julia layout = CDR layout)
 #   * CDR1 (CDR2 uses 4-byte align for 8-byte types; Julia uses 8)
 #   * Wire endianness matches host (no per-field byte swap needed)
+#   * the leftmost leaf carries the struct's max alignment (see below)
 # `LE` is the writer/reader's little-endian type parameter.
 function _is_compact_struct(::Type{T}, isCDR2::Bool, LE::Bool) where T
     LE == (ENDIAN_BOM == 0x04030201) || return false
@@ -98,7 +113,15 @@ function _is_compact_struct(::Type{T}, isCDR2::Bool, LE::Bool) where T
     # happen to lay out the same way (e.g. all 8-byte fields at multiples
     # of 8 anyway). `_struct_cdr_size(T, isCDR2)` handles the per-variant
     # comparison.
-    return _struct_cdr_size(T, isCDR2) == sizeof(T)
+    _struct_cdr_size(T, isCDR2) == sizeof(T) || return false
+    # The blob is loaded/stored after `align(max_align)`. A field-walk reader
+    # instead aligns the *first* field to its own alignment, so the blob only
+    # lands where the reader expects when those two agree — i.e. when the
+    # leftmost leaf already carries the struct's max alignment. (A struct that
+    # leads with a smaller-aligned field — `{UInt16; Float64}` — has internal
+    # padding baked for a max-aligned base; it can't sit at the 2-aligned offset
+    # a field-walk reader would put it at, so it must field-walk instead.)
+    return _first_leaf_align(T, isCDR2) == _wa_align_for(T, isCDR2)
 end
 
 # Map an original field type to the type used in the CDR2-laid-out inner
@@ -266,6 +289,12 @@ CDR1 with no trailing pad.
 The CDR1 wire-compatibility guarantee is for CDR1/XCDR1. The same type still
 encodes correctly under XCDR2 (8-byte primitives are realigned to 4 via
 per-field flattening), but XCDR2 is not this macro's promise.
+
+Whether the resulting type *also* reads/writes as a single load/store and is
+zero-copy `CDRArray`-viewable depends on its field layout (it must lead with its
+widest-aligned field and have no trailing pad) — this macro does **not**
+guarantee it. Call [`cdr_layout`](@ref)`(T)` (or [`iscompact`](@ref)`(T)`) to see
+which tier your type lands in and why.
 """
 macro cdr1_compat(structdef)
     name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr1_compat")
@@ -280,11 +309,11 @@ macro cdr1_compat(structdef)
                   "the generic path.")
     end
 
-    field_exprs    = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
-    companions     = _cdr1_emit_companions(name_sym, f_names)
-    compat_qual    = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
-    write_all_qual = GlobalRef(@__MODULE__, :write_all!)
-    cdrwriter_qual = GlobalRef(@__MODULE__, :CDRWriter)
+    field_exprs     = Expr[Expr(:(::), f_names[i], f_type_exprs[i]) for i in 1:length(f_names)]
+    companions      = _cdr1_emit_companions(name_sym, f_names)
+    compat_qual     = GlobalRef(@__MODULE__, :_is_cdr1_compat_type)
+    write_value_qual = GlobalRef(@__MODULE__, :_write_value)
+    cdrwriter_qual  = GlobalRef(@__MODULE__, :CDRWriter)
 
     return esc(quote
         struct $name_sym
@@ -292,12 +321,15 @@ macro cdr1_compat(structdef)
         end
         $(companions...)
 
-        # Single-value `write` fallback: forward to `write_all!` (the generic
-        # path handles flattening + CDR1 offsets) and return the byte count, as
-        # `Base.write` callers expect.
+        # Single-value `write`: the generic field-walk path (`_write_value`),
+        # which aligns each field independently — the exact inverse of `read`.
+        # (Not `write_all!`: a single packed run aligns the whole struct to its
+        # widest member, which over-pads a flat-but-non-compact struct written at
+        # an offset that isn't a multiple of that alignment — e.g. right after a
+        # string.) Returns the byte count, as `Base.write` callers expect.
         function Base.write(_c::$cdrwriter_qual, _x::$name_sym)
             _p0 = position(_c)
-            $write_all_qual(_c, _x)
+            $write_value_qual(_c, _x)
             return position(_c) - _p0
         end
 
@@ -347,7 +379,9 @@ wire-compatible with standard CDR producers that omit trailing pad.
 matches the host. On a little-endian host (the common case) use the
 default LE encapsulation.
 
-Field types must be primitives or `SArray`s of primitives.
+Field types must be primitives or `SArray`s of primitives. To see whether the
+inner CDR1/CDR2 types land in the single-load/`CDRArray`-viewable tier, call
+[`cdr_layout`](@ref) on them.
 """
 macro cdr_compact(structdef)
     name_sym, f_names, f_type_exprs = _cdr_parse_structdef(structdef, "@cdr_compact")
@@ -486,6 +520,16 @@ macro cdr_compact(structdef)
             throw(ArgumentError(string($(string(name_sym)),
                 ": variant mismatch — writer is CDR", IsCDR2 ? 2 : 1,
                 " but wrapper is ", typeof(_x))))
+        end
+
+        # Single-value `write` routes through the variant-checked `write_all!`
+        # hooks above (so a writer/wrapper mismatch is still an ArgumentError)
+        # rather than the generic struct catch-all, which would happily field-walk
+        # the wrong-variant inner storage. Returns the byte count.
+        function Base.write(_c::$cdrwriter_qual, _x::$name_sym)
+            _p0 = position(_c)
+            $write_all_qual(_c, _x)
+            return position(_c) - _p0
         end
 
         function Base.read(_r::$cdrreader_qual{S, false, LE}, ::Type{$name_sym}) where {S, LE}

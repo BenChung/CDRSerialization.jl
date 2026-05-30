@@ -135,6 +135,74 @@ function _view_array(r::CDRReader{B, IsCDR2, LE}, ::Type{T};
     return CDRArray{T}(mem, start - 1, n)
 end
 
+"""
+    CDRArrayView{E} <: AbstractVector{E}
+
+A *decoding* (non-aliasing) view of a CDR sequence of a **flat fixed-size**
+element `E` (a primitive, `SArray` of primitive, or a struct built transitively
+from those — anything `@cdr1_compat` accepts). Unlike [`CDRArray`](@ref), which
+aliases the raw bytes and so requires `E` to be *compact*, `CDRArrayView`
+field-walk-decodes element `i` on indexing, so it works for **every** flat `E`
+(trailing pad, leading-narrow leaf, foreign endianness — all fine) and returns
+an owned `E` value.
+
+Indexing is O(1): a CDR sequence of a fixed-size struct has at most one
+"phase-shifted" first element, after which the stride is constant (the element's
+max-aligned field erases the start phase, so every element from the second on
+begins at the same alignment). The view stores that head offset + steady stride,
+no per-element table.
+"""
+struct CDRArrayView{E, IsCDR2, LE, S <: DenseVector{UInt8}} <: AbstractVector{E}
+    mem::S
+    origin::Int
+    kind::EncapsulationKind
+    first_pos::Int     # 1-based buffer position where element 1 begins
+    second_pos::Int    # 1-based position where element 2 begins (first_pos + head span)
+    stride::Int        # steady per-element stride (bytes) for elements ≥ 2
+    len::Int
+end
+
+Base.size(a::CDRArrayView) = (getfield(a, :len),)
+Base.IndexStyle(::Type{<:CDRArrayView}) = IndexLinear()
+
+# Element i's start position. Only element 1 can sit at a different phase than
+# the rest; element i ≥ 2 is at a uniform stride. (See the type docstring: the
+# phase map is constant after one step, so this two-segment form is exact for
+# every flat fixed-size element — no offset table needed.)
+@inline _cdrav_pos(a::CDRArrayView, i::Int) =
+    i == 1 ? getfield(a, :first_pos) :
+             getfield(a, :second_pos) + (i - 2) * getfield(a, :stride)
+
+@inline function Base.getindex(a::CDRArrayView{E, IsCDR2, LE, S}, i::Int) where {E, IsCDR2, LE, S}
+    @boundscheck checkbounds(a, i)
+    mem = getfield(a, :mem)
+    mb = MemBuf(mem, _cdrav_pos(a, i), length(mem))
+    r = CDRReader{MemBuf{S}, IsCDR2, LE}(mb, false, false, getfield(a, :origin), getfield(a, :kind))
+    return read(r, E)
+end
+
+# Internal: view a CDR sequence of flat element `E` as a lazy decoding view,
+# advancing the reader past the whole sequence. Measures the head span (element
+# 1) and steady stride (element 2) with two trial reads — exact because the
+# stride is constant from the second element on (see `CDRArrayView`).
+function _seq_view(r::CDRReader{B, IsCDR2, LE}, ::Type{E}) where {B <: _CDRBufLike, IsCDR2, LE, E}
+    n = Int(sequenceLength(r))
+    src = r.src
+    mem = _buf_data(src)
+    S = typeof(mem)
+    origin = r.origin
+    kind = r.kind
+    first_pos = _buf_pos(src)
+    n == 0 && return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, first_pos, 0, 0)
+    read(r, E)                                   # consume element 1
+    second_pos = _buf_pos(src)
+    n == 1 && return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, second_pos, second_pos - first_pos, 1)
+    read(r, E)                                   # consume element 2 → measure steady stride
+    stride = _buf_pos(src) - second_pos
+    _buf_pos!(src, second_pos + (n - 1) * stride) # advance past the remaining elements
+    return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, second_pos, stride, n)
+end
+
 # A CDR string is a `UInt32` length (including the null terminator) followed by
 # that many UTF-8 bytes. The content bytes already sit in the buffer, so they
 # can be presented as an `AbstractString` with no copy.
@@ -291,6 +359,108 @@ end
     return :($(B <: _CDRBufLike))
 end
 
+# --- Layout introspection: make the capability hierarchy visible -----------
+#
+# Serializability, single-load/store, and zero-copy viewability are three
+# *nested* properties, and which ones a type has is otherwise invisible at the
+# call site — especially when the type came out of `@cdr1_compat`/`@cdr_compact`.
+# `cdr_layout(T)` reports all three plus the *reason* a struct is not compact
+# (trailing pad vs. leading-narrow leaf), so the distinction is discoverable in
+# the REPL instead of surfacing as a `view` that throws at runtime.
+
+"""
+    CDRLayout
+
+The result of [`cdr_layout`](@ref): a readable report of which CDR capabilities
+a type has, beyond plain serialization (every concrete struct reads/writes as
+standard CDR via field-walk). The capabilities, which **nest**
+`viewable ⟹ single_op ⟹ fixed_size`:
+
+  * `fixed_size`  — no variable-length fields, so a constant compile-time wire
+    size (eligible for `reinterpret_*` over raw memory when also compact).
+  * `single_op`   — `read`/`write` is a single `unsafe_load`/`unsafe_store!`
+    (i.e. [`iscompact`](@ref)).
+  * `viewable`    — `view(r, CDRArray{T})` can alias a sequence with no copy.
+
+`why` explains the layout — in particular *why* a `fixed_size` struct is not
+compact (trailing padding vs. a leading field narrower than its max alignment).
+"""
+struct CDRLayout
+    type::Any
+    cdr2::Bool
+    fixed_size::Bool
+    single_op::Bool
+    viewable::Bool
+    why::String
+end
+
+function _cdr_layout_why(::Type{T}, cdr2::Bool, host::Bool, single::Bool) where T
+    if _is_packed_leaf(T)
+        return T === Char ? "primitive leaf (Char is 4 bytes in Julia, 1 on the wire — not array-viewable)" :
+                            "primitive / SArray-of-primitive leaf — its own bytes are the wire bytes"
+    end
+    (T <: AbstractString || T <: AbstractArray) &&
+        return "variable-length sequence — length-prefixed, decoded element-by-element"
+    isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0 ||
+        return "not a concrete serializable type"
+    single && return "compact: Julia in-memory layout is bit-identical to the CDR wire layout"
+    _is_cdr1_compat_type(T) || return "has variable-length or non-isbits fields — field-walk only, never a single blob or view"
+    # Flat (standard CDR1) but not compact: say which condition failed.
+    if !host
+        return "flat standard CDR1; would be compact but the host is not little-endian"
+    elseif _struct_cdr_size(T, cdr2) != sizeof(T)
+        return string("flat standard CDR1; field-walked because Julia adds trailing padding ",
+                      "(sizeof ", sizeof(T), " ≠ CDR data size ", _struct_cdr_size(T, cdr2),
+                      ") — not a single blob, not array-viewable")
+    elseif _first_leaf_align(T, cdr2) != _wa_align_for(T, cdr2)
+        return string("flat standard CDR1; field-walked because it leads with a field aligned to ",
+                      _first_leaf_align(T, cdr2), " < the struct's max alignment ", _wa_align_for(T, cdr2),
+                      " — its sequence elements aren't uniformly strided, so not array-viewable")
+    else
+        return "flat standard CDR1, field-walked"
+    end
+end
+
+"""
+    cdr_layout(::Type{T}; cdr2=false) -> CDRLayout
+
+Report `T`'s CDR capabilities — does it encode as standard CDR1, read/write as a
+single `unsafe_load`/`unsafe_store!`, and can `view(r, CDRArray{T})` alias it —
+and, for a struct that *isn't* compact, *why* (trailing padding vs. a
+leading field narrower than the struct's max alignment). Host endianness is
+assumed (as for the reader-less [`iscompact`](@ref)).
+
+Use it to see, at a glance, which tier a type produced by `@cdr1_compat` /
+`@cdr_compact` lands in: the capabilities nest `viewable ⟹ single_op ⟹
+standard_cdr1`, and being standard-CDR1-serializable does **not** imply
+viewable.
+
+```julia
+julia> cdr_layout(MyMsg)   # prints a capability summary + the reason
+```
+"""
+function cdr_layout(::Type{T}; cdr2::Bool=false) where T
+    host = (ENDIAN_BOM == 0x04030201)
+    single = _is_packed_leaf(T) || (host && _is_compact_struct(T, cdr2, host))
+    viewable = _is_view_eltype(T, cdr2, host)
+    fixed = _is_packed_leaf(T) || _is_cdr1_compat_type(T)
+    return CDRLayout(T, cdr2, fixed, single, viewable,
+                     _cdr_layout_why(T, cdr2, host, single))
+end
+
+function Base.show(io::IO, ::MIME"text/plain", l::CDRLayout)
+    println(io, "CDRLayout(", l.type, l.cdr2 ? "; XCDR2)" : "; CDR1)")
+    _yn(b) = b ? "yes" : "no "
+    println(io, "  fixed-size (flat)  : ", _yn(l.fixed_size), "   (no var-length fields; O(1) CDRArrayView decoding)")
+    println(io, "  single load/store  : ", _yn(l.single_op),  "   (read/write is one unsafe op — iscompact)")
+    println(io, "  CDRArray viewable  : ", _yn(l.viewable),    "   (view(r, CDRArray{T}) can zero-copy alias)")
+    print(io,   "  → ", l.why)
+end
+
+Base.show(io::IO, l::CDRLayout) =
+    print(io, "CDRLayout(", l.type, ": fixed_size=", l.fixed_size,
+          ", single_op=", l.single_op, ", viewable=", l.viewable, ")")
+
 """
     view(r::CDRReader, ::Type{CDRArray{T}}) -> CDRArray{T}
     view(r::CDRReader, ::Type{CDRString})   -> CDRString
@@ -305,7 +475,9 @@ of `read(r, T)` (the struct's view fields already alias the buffer).
 """
 function Base.view(r::CDRReader, ::Type{V}) where {T, V <: CDRArray{T}}
     canview(r, V) || throw(ArgumentError(string("view: cannot alias ", V,
-        " for this reader — element ", T, " is not compact under its variant/endianness")))
+        " for this reader — element ", T, " ",
+        cdr_layout(T; cdr2=isCDR2(r)).why,
+        ". Use read(r, Vector{", T, "}) for an owned copy, or check canview(r, ", V, ") first.")))
     return _view_array(r, T)
 end
 function Base.view(r::CDRReader, ::Type{CDRString})
@@ -313,6 +485,108 @@ function Base.view(r::CDRReader, ::Type{CDRString})
         "view: cannot alias CDRString (reader is not buffer-backed)"))
     return _view_string(r)
 end
+
+# `view(r, CDRArrayView{E})`: lazy *decoding* sequence view. Unlike
+# `view(r, CDRArray{E})` it doesn't alias, so it works for any flat fixed-size
+# `E` (not just compact) — `canview` here only asks that `E` be flat.
+@generated function canview(r::CDRReader{B}, ::Type{V}) where {B, E, V <: CDRArrayView{E}}
+    return :($(B <: _CDRBufLike && _is_cdr1_compat_type(E)))
+end
+function Base.view(r::CDRReader, ::Type{V}) where {E, V <: CDRArrayView{E}}
+    canview(r, V) || throw(ArgumentError(string("view: ", V,
+        " needs a flat fixed-size element and a buffer-backed reader — ", E, " ",
+        cdr_layout(E; cdr2=isCDR2(r)).why, ". Use read(r, Vector{", E, "}) instead.")))
+    return _seq_view(r, E)
+end
+
+# --- Nominal struct view ----------------------------------------------------
+#
+# `read_view(r, T)` / `view(r, T)` return a `CDRView{T}` — a nominal wrapper that
+# derives `propertynames`/`getproperty`/`==`/`show` from `T` — rather than a bare
+# NamedTuple. Being nominal it is `isa CDRView{T}`-dispatchable and nests for free
+# (a nested struct field becomes a `CDRView{Nested}`). Each variable-length field
+# is substituted with its zero-copy view (`String` → `CDRString`, `Vector{E}` →
+# `CDRArray{E}`); scalar and fixed-size fields decode to ordinary values; fields
+# whose elements can't be aliased fall back to an owned decode. The owned struct
+# `T` keeps its `String`/`Vector` fields for construction and publishing.
+
+"""
+    CDRView{T} <: Any
+
+A lazy, nominal view of a struct `T` over a reader's buffer, produced by
+[`read_view`](@ref) / `view(r, T)`. Field access mirrors `T`
+(`v.field`, `propertynames`, `==`, `show`), but variable-length fields are
+zero-copy views: a `String` field reads as a [`CDRString`](@ref) and a
+`Vector{E}` field as a [`CDRArray{E}`](@ref). Nested struct fields are
+themselves `CDRView`s. Compares equal to another `CDRView{T}` and to an owned
+`T` of the same field values.
+"""
+struct CDRView{T, NT <: NamedTuple}
+    fields::NT
+end
+
+CDRView{T}(fields::NT) where {T, NT <: NamedTuple} = CDRView{T, NT}(fields)
+
+Base.propertynames(::CDRView{T}) where T = fieldnames(T)
+@inline Base.getproperty(v::CDRView, name::Symbol) = getfield(getfield(v, :fields), name)
+
+# Two views of the same struct compare field-wise; a view also compares equal to
+# an owned `T` (CDRString == String and CDRArray == Vector both compare by value,
+# and a nested CDRView vs nested owned struct recurses through these methods).
+function Base.:(==)(a::CDRView{T}, b::CDRView{T}) where T
+    af = getfield(a, :fields); bf = getfield(b, :fields)
+    for n in fieldnames(T)
+        getfield(af, n) == getfield(bf, n) || return false
+    end
+    return true
+end
+function Base.:(==)(a::CDRView{T}, b::T) where T
+    af = getfield(a, :fields)
+    for n in fieldnames(T)
+        getfield(af, n) == getfield(b, n) || return false
+    end
+    return true
+end
+Base.:(==)(a::T, b::CDRView{T}) where T = b == a
+
+function Base.show(io::IO, v::CDRView{T}) where T
+    print(io, "CDRView{", T, "}(")
+    first = true
+    for n in fieldnames(T)
+        first || print(io, ", ")
+        first = false
+        print(io, n, "=", repr(getfield(getfield(v, :fields), n)))
+    end
+    print(io, ")")
+end
+
+# --- materialize: copy a view out of the buffer into a fully-owned value ----
+#
+# A `CDRView{T}` and its `CDRString`/`CDRArray`/`CDRArrayView` fields alias the
+# reader's buffer. `materialize` walks the view and rebuilds an owned `T` whose
+# tree holds no view wrappers and no reference to the buffer, so the value can
+# outlive the bytes it was read from (e.g. a borrowed Zenoh `Sample`). Leaves
+# copy by value: `collect` loads each array element out with `unsafe_load`,
+# `String` copies the UTF-8 bytes. The owned struct is rebuilt through `T`'s
+# positional constructor, which coerces each materialized field to its declared
+# type. The catch-all leaves already-owned fields (primitives, SArrays, owned
+# `Vector`s of strings/dynamic structs) untouched — they alias nothing.
+"""
+    materialize(v::CDRView{T}) -> T
+
+Copy a [`CDRView`](@ref) out of the reader's buffer into a fully-owned `T`,
+recursively: `CDRString` → `String`, `CDRArray`/`CDRArrayView` → `Vector`,
+nested `CDRView` → owned struct. The result aliases nothing, so it stays valid
+after the source buffer is freed or overwritten. Also spelled `convert(T, v)`.
+"""
+materialize(v::CDRView{T}) where T =
+    T(map(materialize, values(getfield(v, :fields)))...)
+materialize(s::CDRString)    = String(s)
+materialize(a::CDRArray)     = collect(a)
+materialize(a::CDRArrayView) = collect(a)
+materialize(x) = x
+
+Base.convert(::Type{T}, v::CDRView{T}) where T = materialize(v)
 
 # Read one field for `read_view`. Every branch condition is a compile-time
 # constant (a property of `FT`/`IsCDR2`/`LE`), so the compiler prunes this to
@@ -329,9 +603,11 @@ end
     elseif FT <: AbstractVector
         ET = eltype(FT)
         if _is_view_eltype(ET, IsCDR2, LE)
-            return _view_array(r, ET)
+            return _view_array(r, ET)       # compact element → zero-copy CDRArray alias
+        elseif _is_cdr1_compat_type(ET)
+            return _seq_view(r, ET)         # flat (but not compact) element → lazy decoding CDRArrayView
         else
-            return read(r, FT)
+            return read(r, FT)              # variable-length element → owned decode
         end
     elseif isstructtype(FT) && isconcretetype(FT) && fieldcount(FT) > 0
         return read_view(r, FT)
@@ -341,14 +617,16 @@ end
 end
 
 """
-    read_view(r::CDRReader, ::Type{T}) -> NamedTuple
+    read_view(r::CDRReader, ::Type{T}) -> CDRView{T}
 
 Read a struct `T` as a lazy view: scalar and fixed-size fields are decoded to
 ordinary values, but each variable-length sequence field becomes a zero-copy
 [`CDRArray`](@ref) aliasing the reader's buffer — so the elements are never
-touched or copied. Nested structs that contain sequences recurse to nested
-views. The result is a `NamedTuple` with `T`'s field names, accessed the same
-way (`v.field`, `v.seq[i]`); `T` itself is unchanged.
+touched or copied — and each `String` field a zero-copy [`CDRString`](@ref).
+Nested structs recurse to nested views. The result is a nominal
+[`CDRView{T}`](@ref) carrying `T`'s field names, accessed the same way
+(`v.field`, `v.seq[i]`) and `isa CDRView{T}`-dispatchable; `T` itself is
+unchanged.
 
 Sequence fields whose elements can't be aliased (strings, or jagged/dynamic
 element structs) fall back to a normal decode. Only IOBuffer-/MemBuf-backed
@@ -362,8 +640,14 @@ readers are supported.
     # `ntuple(…, Val(N))` unrolls, so each `fieldtype(T, i)` folds to a
     # concrete type and the tuple is built left-to-right (fields read in order).
     vals = ntuple(i -> _read_view_field(r, fieldtype(T, i)), Val(fieldcount(T)))
-    return NamedTuple{fieldnames(T)}(vals)
+    return CDRView{T}(NamedTuple{fieldnames(T)}(vals))
 end
+
+# `view(r, T)` for a plain struct is an alias of `read_view(r, T)`. The reader
+# is left unconstrained to match the `CDRArray`/`CDRString` view methods (so
+# this stays strictly less specific than all of them — no dispatch ambiguity);
+# a non-buffer-backed reader errors in `read_view`, which requires one.
+Base.view(r::CDRReader, ::Type{T}) where T = read_view(r, T)
 
 # --- @cdr_compact view-struct support -------------------------------------
 #
