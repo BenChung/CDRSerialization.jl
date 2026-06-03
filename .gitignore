@@ -7,6 +7,10 @@
 node_modules/
 package-lock.json
 
+# Generated profiling artifacts (tools/profile/inspect_ir.jl writes to CWD)
+*.ll
+*.s
+
 # Editor
 *.swp
 .DS_Store

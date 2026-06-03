@@ -80,7 +80,7 @@ end
     write(w, UInt32(42))
     seekstart(data)
     r = CDRSerialization.CDRReader(data)
-    h = CDRSerialization.memberHeaderV1(r)
+    r, h = CDRSerialization.memberHeaderV1(r)
     @test h.mustUnderstand == true
     @test h.id == 1
     @test h.objectSize == 4
@@ -93,12 +93,40 @@ end
     append!(buf, reinterpret(UInt8, UInt32[0xA0000005]))
     append!(buf, reinterpret(UInt8, UInt32[42]))
     r = CDRSerialization.CDRReader(IOBuffer(buf))
-    h = CDRSerialization.memberHeaderV2(r)
+    r, h = CDRSerialization.memberHeaderV2(r)
     @test h.mustUnderstand == true
     @test h.id == 5
     @test h.objectSize == 4
     @test h.lengthCode == 2
     @test read(r, UInt32) == 42
+end
+
+@testset "kind-explicit CDRReader (concrete type + validation)" begin
+    io = IOBuffer()
+    CDRSerialization.write_all!(CDRSerialization.CDRWriter(io, CDRSerialization.CDR_LE),
+                                UInt32(7), [1.0, 2.0, 3.0])
+    buf = take!(io)   # CDR1, little-endian
+
+    # Declared kind concrete in the type — and reads back the same as the
+    # runtime-kind reader.
+    r = CDRSerialization.CDRReader(buf, Val(false), Val(true))
+    @test r isa CDRSerialization.CDRReader{<:Any, false, true}
+    @test read(r, UInt32) == 7
+    @test read(r, Vector{Float64}) == [1.0, 2.0, 3.0]
+
+    # `Val(EncapsulationKind)` sugar resolves to the same concrete type.
+    @test CDRSerialization.CDRReader(buf, Val(CDRSerialization.CDR_LE)) isa
+          CDRSerialization.CDRReader{<:Any, false, true}
+
+    # The reader type is inferred concretely from a raw buffer (no barrier
+    # needed) — the whole point of the explicit form.
+    mk(b) = CDRSerialization.CDRReader(b, Val(false), Val(true))
+    @test isconcretetype(only(Base.return_types(mk, (typeof(buf),))))
+
+    # Mismatched declaration is rejected.
+    @test_throws ArgumentError CDRSerialization.CDRReader(buf, Val(true), Val(true))   # CDR2 vs CDR1
+    @test_throws ArgumentError CDRSerialization.CDRReader(buf, Val(false), Val(false)) # BE vs LE
+    @test_throws ArgumentError CDRSerialization.CDRReader(buf, Val(CDRSerialization.CDR2_LE))
 end
 
 @testset "Char round-trip" begin
@@ -208,7 +236,7 @@ end
     append!(raw, reinterpret(UInt8, UInt16[4]))           # objectSize = 4
     append!(raw, reinterpret(UInt8, UInt32[42]))           # payload
     r = CDRSerialization.CDRReader(IOBuffer(raw))
-    h = CDRSerialization.memberHeaderV1(r)
+    r, h = CDRSerialization.memberHeaderV1(r)
     @test h.implementationSpecific == true
     @test h.id == 1
     @test h.objectSize == 4
@@ -298,7 +326,7 @@ end
     append!(raw, reinterpret(UInt8, UInt16[4]))            # objectSize
     append!(raw, reinterpret(UInt8, UInt32[0]))            # payload (to be skipped)
     r = CDRSerialization.CDRReader(IOBuffer(raw))
-    h = CDRSerialization.memberHeaderV1(r)
+    r, h = CDRSerialization.memberHeaderV1(r)
     @test h.ignore == true
     @test h.objectSize == 4
     skip(r, Int(h.objectSize))

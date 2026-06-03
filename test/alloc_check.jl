@@ -160,3 +160,66 @@ end
     @test isempty(_allocs(_calc_value, (_CalcT, _AllocNamedPose)))
     @test isempty(_allocs(_calc_value, (_CalcT, Vector{_AllocPose})))
 end
+
+# Flat but NOT compact (trailing pad after `flag`): a sequence of these views as
+# a `CDRArrayView`, whose `getindex` decodes cursor-free (no per-element reader).
+struct _AllocTail
+    a::Float64
+    b::Float64
+    flag::UInt8
+end
+
+# String + Vector{flat-non-compact} fields → the view carries a `CDRString` and a
+# `CDRArrayView`, the two paths that previously boxed.
+struct _AllocFrame
+    id::UInt32
+    pts::Vector{_AllocTail}
+    label::String
+end
+
+const _CdrStrT = CDRSerialization.CDRString{Vector{UInt8}}
+const _CdrAVT  = CDRSerialization.CDRArrayView{_AllocTail, false, true, Vector{UInt8}}
+
+_read_view_typed(r, ::Type{T}) where T = read_view(r, T)
+_cdrav_get(v, i) = @inbounds v[i]
+_str_len(s) = ncodeunits(s)
+_str_cu(s)  = codeunit(s, 1)
+
+@testset "AllocCheck: zero-copy views (read_view / CDRArrayView / CDRString)" begin
+    # On a concrete reader type (the state after a dispatch barrier), the
+    # generated straight-line decode yields a fully concrete `CDRView` returned
+    # by value — including its `CDRString` and `CDRArrayView` fields.
+    @test isempty(_allocs(_read_view_typed, (_ReaderT, Type{_AllocFrame})))
+    # `CDRArrayView` element decode threads a plain `Int` cursor — no `MemBuf`.
+    @test isempty(_allocs(_cdrav_get, (_CdrAVT, Int)))
+    # `CDRString` aliases the buffer; reading code units copies nothing.
+    @test isempty(_allocs(_str_len, (_CdrStrT,)))
+    @test isempty(_allocs(_str_cu, (_CdrStrT,)))
+end
+
+# End-to-end from a raw byte buffer: a kind-explicit reader plus `read_view`
+# plus consuming the `CDRString`/`CDRArrayView` fields. The transient cursor is
+# stack-promoted, so the whole decode is heap-free. A runtime `@allocated`
+# check (not AllocCheck) because the guarantee depends on escape analysis
+# promoting the mutable `MemBuf` — a property of the optimized code, not the
+# static call graph.
+function _decode_frame_explicit(buf)
+    r = CDRSerialization.CDRReader(buf, Val(false), Val(true))
+    v = read_view(r, _AllocFrame)
+    s = 0.0
+    for p in v.pts
+        s += p.a
+    end
+    return s + ncodeunits(v.label) + Int(v.id)
+end
+
+@testset "zero-alloc kind-explicit decode (raw buffer, no barrier)" begin
+    io = IOBuffer()
+    CDRSerialization.write_all!(CDRSerialization.CDRWriter(io, CDRSerialization.CDR_LE),
+                                _AllocFrame(UInt32(7),
+                                            [_AllocTail(Float64(i), 2.0, UInt8(i % 256)) for i in 1:16],
+                                            "base_link_frame"))
+    buf = take!(io)
+    _decode_frame_explicit(buf)                 # warm up / compile
+    @test @allocated(_decode_frame_explicit(buf)) == 0
+end

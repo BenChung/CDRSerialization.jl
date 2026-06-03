@@ -39,8 +39,13 @@
 end
 
 # `IsCDR2` and `LE` are type parameters so kind- and endian-specific paths
-# dispatch at compile time.
-mutable struct CDRReader{B <: IO, IsCDR2, LE}
+# dispatch at compile time. Immutable: the read cursor lives in the (mutable)
+# `src` buffer, and the only field that ever changes during a parse — `origin`,
+# reset at each XCDR1 parameter-list member boundary — is handled functionally
+# by `resetOrigin` returning a fresh reader (see `memberHeaderV1`). Keeping the
+# reader itself immutable lets it stack-allocate, so per-message and
+# per-element (CDRArrayView/CDRView) readers cost no heap allocation.
+struct CDRReader{B <: IO, IsCDR2, LE}
     src::B
 
     usesDelimiterHeader::Bool
@@ -68,6 +73,54 @@ end
 # `Vector{UInt8}` — with no IOBuffer wrapper. Same wire layout: 4-byte
 # preamble at the start, then payload.
 CDRReader(mem::DenseVector{UInt8}) = CDRReader(MemBuf(mem))
+
+# --- Kind-explicit construction --------------------------------------------
+#
+# `CDRReader(buf)` reads the encapsulation kind from the preamble at runtime, so
+# its `IsCDR2`/`LE` type parameters — and the type of every view derived from it
+# — are runtime-determined; inference can't pin them down, so a view built and
+# consumed in the same scope has `Any`-typed fields unless a dispatch barrier
+# (`read_view(f, buf, T)`) re-specialises them.
+#
+# When the wire format is fixed and known up front (a given topic/middleware),
+# declare it instead: `CDRReader(buf, Val(isCDR2), Val(LE))` (or
+# `CDRReader(buf, Val(CDR_LE))`). The reader type is then concrete at the call
+# site, so `read_view`/views stay type-stable and allocation-free with no
+# barrier. The preamble is still consumed and validated against the declaration.
+# `@inline` + the inlinable `_read_prim` (rather than the generic `read(io, T)`)
+# matter for allocation: with both, the transient `MemBuf` cursor never escapes
+# into a non-inlined call, so escape analysis stack-promotes it and the whole
+# `CDRReader(bytes, Val…)` + `read_view` pipeline runs with zero heap allocation
+# — not even the cursor. (The runtime-kind `CDRReader(buf)` can't do this: its
+# type isn't known at the call site, so the reader is materialised on the heap.)
+@inline function CDRReader(buf::A, ::Val{IsCDR2}, ::Val{LE}) where {A <: IO, IsCDR2, LE}
+    (IsCDR2 isa Bool && LE isa Bool) ||
+        throw(ArgumentError("CDRReader: IsCDR2 and LE must be Bool"))
+    preamble = ntoh(_read_prim(buf, UInt32))
+    kind = UInt8((preamble >> 16) & 0xFF)
+    aCDR2, aLE, usesDelimiterHeader, usesMemberHeader = getEncapsulationKind(kind)
+    (aCDR2 === IsCDR2 && aLE === LE) ||
+        throw(ArgumentError(string(
+            "CDRReader: buffer encapsulation (kind byte ", repr(kind), ", CDR2=",
+            aCDR2, ", LE=", aLE, ") does not match declared CDR2=", IsCDR2,
+            ", LE=", LE)))
+    # `EncapsulationKind(kind)` additionally rejects an unrecognised kind byte.
+    return CDRReader{A, IsCDR2, LE}(buf, usesDelimiterHeader, usesMemberHeader,
+                                    4, EncapsulationKind(kind))
+end
+
+@inline CDRReader(mem::DenseVector{UInt8}, c2::Val, le::Val) = CDRReader(MemBuf(mem), c2, le)
+
+# Sugar: declare the exact `EncapsulationKind` rather than the two flags.
+# Generated so the kind → (IsCDR2, LE) split happens at expansion time and the
+# call lowers to the concrete-typed `Val`/`Val` constructor above.
+@generated function CDRReader(buf::Union{IO, DenseVector{UInt8}}, ::Val{K}) where {K}
+    K isa EncapsulationKind ||
+        return :(throw(ArgumentError(string("CDRReader: expected an EncapsulationKind, got ",
+                                            $(QuoteNode(K))))))
+    isCDR2, le, _, _ = getEncapsulationKind(UInt8(K))
+    return :(CDRReader(buf, Val($isCDR2), Val($le)))
+end
 
 @inline isCDR2(::CDRReader{<:Any, B}) where B = B
 @inline littleEndian(::CDRReader{<:Any, <:Any, L}) where L = L
@@ -215,7 +268,14 @@ dHeader(r::CDRReader) = read(r, UInt32)
 emHeader(r::CDRReader{<:Any, true})  = memberHeaderV2(r)
 emHeader(r::CDRReader{<:Any, false}) = memberHeaderV1(r)
 
-resetOrigin(r::CDRReader) = r.origin = position(r.src)
+# The reader is immutable, so resetting the alignment origin (done at each XCDR1
+# parameter-list member boundary, where a member's value re-aligns from its own
+# start) yields a *new* reader sharing the same `src` cursor. Member-header
+# readers therefore return `(reader, header)`: the caller threads the returned
+# reader so subsequent reads align against the member's origin.
+resetOrigin(r::CDRReader{B, IsCDR2, LE}) where {B, IsCDR2, LE} =
+    CDRReader{B, IsCDR2, LE}(r.src, r.usesDelimiterHeader, r.usesMemberHeader,
+                             position(r.src), r.kind)
 
 const EXTENDED_PID = 0x3f01
 const SENTINEL_PID = 0x3f02
@@ -243,10 +303,11 @@ function memberHeaderV1(r::CDRReader)
     sentinelPIDFlag = (idHeader & 0x3fff) === SENTINEL_PID
     if sentinelPIDFlag
       # Caller saw a sentinel where it expected another member: an absent
-      # optional member at the end of a struct.
-      return (id=UInt32(SENTINEL_PID), objectSize=UInt32(0), mustUnderstand=false,
+      # optional member at the end of a struct. No member body follows, so the
+      # origin is left as-is (reader returned unchanged).
+      return (r, (id=UInt32(SENTINEL_PID), objectSize=UInt32(0), mustUnderstand=false,
               implementationSpecific=false, ignore=false,
-              readSentinelHeader=true, lengthCode=UInt32(0))
+              readSentinelHeader=true, lengthCode=UInt32(0)))
     end
 
     # Ignore-PID 0x3f03: skip the id, still consume the size + value.
@@ -259,10 +320,10 @@ function memberHeaderV1(r::CDRReader)
 
     id = extendedPIDFlag ? read(r, UInt32) : UInt32(idHeader & 0x3fff)
     objectSize = extendedPIDFlag ? read(r, UInt32) : UInt32(read(r, UInt16))
-    resetOrigin(r)
-    return (; id, objectSize, mustUnderstand=mustUnderstandFlag,
+    r = resetOrigin(r)
+    return (r, (; id, objectSize, mustUnderstand=mustUnderstandFlag,
             implementationSpecific=implementationSpecificFlag, ignore=ignorePIDFlag,
-            readSentinelHeader=false, lengthCode=UInt32(0))
+            readSentinelHeader=false, lengthCode=UInt32(0)))
 end
 
 sentinelHeader(::CDRReader{<:Any, true}) = nothing
@@ -284,9 +345,12 @@ function memberHeaderV2(r::CDRReader)
 
     objectSize = emHeaderObjectSize(r, lengthCode);
 
-    return (; id, objectSize, mustUnderstand,
+    # XCDR2 measures member alignment from the encapsulation start, so there is
+    # no per-member origin reset; the reader is returned unchanged to match
+    # `memberHeaderV1`'s `(reader, header)` contract.
+    return (r, (; id, objectSize, mustUnderstand,
             implementationSpecific=false, ignore=false,
-            readSentinelHeader=false, lengthCode)
+            readSentinelHeader=false, lengthCode))
 end
 
 function emHeaderObjectSize(r::CDRReader, lengthCode)

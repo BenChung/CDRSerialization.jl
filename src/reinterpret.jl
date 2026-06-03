@@ -122,7 +122,7 @@ end
 # `view(r, CDRArray{T})`; this is also used by `read_view` and the
 # `@cdr_compact` view-struct decode. `num` defaults to the stream's UInt32
 # length prefix; pass it for a fixed-length sequence with no prefix.
-function _view_array(r::CDRReader{B, IsCDR2, LE}, ::Type{T};
+@inline function _view_array(r::CDRReader{B, IsCDR2, LE}, ::Type{T};
                      num=sequenceLength(r)) where {B <: _CDRBufLike, IsCDR2, LE, T}
     align(r, _wa_align_for(T, IsCDR2))
     src = r.src
@@ -173,19 +173,94 @@ Base.IndexStyle(::Type{<:CDRArrayView}) = IndexLinear()
     i == 1 ? getfield(a, :first_pos) :
              getfield(a, :second_pos) + (i - 2) * getfield(a, :stride)
 
+# --- Cursor-free flat-element decode --------------------------------------
+#
+# `getindex` decodes one element straight out of the buffer with a plain `Int`
+# cursor and direct `unsafe_load`s — no `MemBuf`/`CDRReader`. A reader-backed
+# decode can't be made allocation-free here: the cursor is a *mutable* `MemBuf`
+# nested in the reader, which Julia's escape analysis won't stack-promote, so a
+# per-element reader leaks a small heap allocation no matter how it's inlined.
+# A local `Int` cursor always lives in a register, so this allocates nothing.
+# Each branch reproduces the matching `read(::CDRReader, …)` method in
+# `reader.jl` byte-for-byte (alignment relative to `origin`, big-endian `ntoh`).
+
+# Endian fixups mirroring `_maybe_swap`/`_readStaticArrayBody`: a little-endian
+# stream on a little-endian host needs no swap; a big-endian stream applies
+# `ntoh` to every multi-byte scalar.
+@inline _flat_swap(::Val{true},  v) = v
+@inline _flat_swap(::Val{false}, v) = sizeof(v) == 1 ? v : ntoh(v)
+@inline _flat_swap_nt(::Val{true},  nt) = nt
+@inline _flat_swap_nt(::Val{false}, nt::NTuple{L, T}) where {L, T} = sizeof(T) == 1 ? nt : map(ntoh, nt)
+
+const _FlatPrim = Union{Int8, UInt8, Bool, Int16, UInt16, Int32, UInt32, Float32,
+                        Int64, UInt64, Float64}
+
+# Emit (into `stmts`) the decode of a value of type `T` from buffer symbol
+# `mem` at the 1-based `Int` cursor `p`, aligning relative to 0-based `origin`
+# and advancing `p` past the value; returns the expression holding the decoded
+# `T`. Runs at `@generated` expansion time, recursing structurally.
+function _flat_gen!(stmts::Vector{Any}, IsCDR2::Bool, LE::Bool, @nospecialize(T),
+                    mem::Symbol, p::Symbol, origin::Symbol)
+    if T === Char
+        g = gensym(:c)
+        push!(stmts, :($g = Char(unsafe_load(Ptr{UInt8}(pointer($mem, $p))))))
+        push!(stmts, :($p += 1))
+        return g
+    elseif T <: _FlatPrim
+        a = _wa_align_for(T, IsCDR2); sz = sizeof(T)
+        a > 1 && push!(stmts, :($p += ($a - (($p - 1 - $origin) & $(a - 1))) & $(a - 1)))
+        g = gensym(:v)
+        push!(stmts, :($g = _flat_swap(Val($LE), unsafe_load(Ptr{$T}(pointer($mem, $p))))))
+        push!(stmts, :($p += $sz))
+        return g
+    elseif T <: SArray
+        ET = T.parameters[2]::Type; L = T.parameters[4]::Int
+        if ET <: _FlatPrim
+            L == 0 && return :($T(ntuple(_ -> zero($ET), Val($L))))
+            a = _wa_align_for(ET, IsCDR2)
+            a > 1 && push!(stmts, :($p += ($a - (($p - 1 - $origin) & $(a - 1))) & $(a - 1)))
+            g = gensym(:sa)
+            push!(stmts, :($g = $T(_flat_swap_nt(Val($LE),
+                          unsafe_load(Ptr{NTuple{$L, $ET}}(pointer($mem, $p)))))))
+            push!(stmts, :($p += $(L * sizeof(ET))))
+            return g
+        else
+            elems = Any[_flat_gen!(stmts, IsCDR2, LE, ET, mem, p, origin) for _ in 1:L]
+            return :($T($(Expr(:tuple, elems...))))
+        end
+    elseif isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0
+        fields = Any[_flat_gen!(stmts, IsCDR2, LE, fieldtype(T, i), mem, p, origin)
+                     for i in 1:fieldcount(T)]
+        return :($T($(fields...)))
+    else
+        return :(throw(ArgumentError(string("CDRArrayView decode: unsupported element type ", $T))))
+    end
+end
+
+@generated function _flat_load(mem::DenseVector{UInt8}, pos::Int, origin::Int,
+                               ::Val{IsCDR2}, ::Val{LE}, ::Type{E}) where {IsCDR2, LE, E}
+    stmts = Any[]
+    val = _flat_gen!(stmts, IsCDR2, LE, E, :mem, :p, :origin)
+    return quote
+        p = pos
+        GC.@preserve mem begin
+            $(stmts...)
+            $val
+        end
+    end
+end
+
 @inline function Base.getindex(a::CDRArrayView{E, IsCDR2, LE, S}, i::Int) where {E, IsCDR2, LE, S}
     @boundscheck checkbounds(a, i)
     mem = getfield(a, :mem)
-    mb = MemBuf(mem, _cdrav_pos(a, i), length(mem))
-    r = CDRReader{MemBuf{S}, IsCDR2, LE}(mb, false, false, getfield(a, :origin), getfield(a, :kind))
-    return read(r, E)
+    return _flat_load(mem, _cdrav_pos(a, i), getfield(a, :origin), Val(IsCDR2), Val(LE), E)
 end
 
 # Internal: view a CDR sequence of flat element `E` as a lazy decoding view,
 # advancing the reader past the whole sequence. Measures the head span (element
 # 1) and steady stride (element 2) with two trial reads — exact because the
 # stride is constant from the second element on (see `CDRArrayView`).
-function _seq_view(r::CDRReader{B, IsCDR2, LE}, ::Type{E}) where {B <: _CDRBufLike, IsCDR2, LE, E}
+@inline function _seq_view(r::CDRReader{B, IsCDR2, LE}, ::Type{E}) where {B <: _CDRBufLike, IsCDR2, LE, E}
     n = Int(sequenceLength(r))
     src = r.src
     mem = _buf_data(src)
@@ -293,7 +368,7 @@ end
 
 # Internal: view a CDR string over the reader's buffer, advancing past the
 # content and null terminator. Public reader spelling is `view(r, CDRString)`.
-function _view_string(r::CDRReader{B}) where {B <: _CDRBufLike}
+@inline function _view_string(r::CDRReader{B}) where {B <: _CDRBufLike}
     len = Int(sequenceLength(r))       # CDR length: content + null terminator
     src = r.src
     mem = _buf_data(src)
@@ -636,13 +711,24 @@ Sequence fields whose elements can't be aliased (strings, or jagged/dynamic
 element structs) fall back to a normal decode. Only IOBuffer-/MemBuf-backed
 readers are supported.
 """
+# Thin always-inline entry that force-inlines the generated decode below. This
+# matters for allocation: a kind-explicit reader over a raw buffer carries a
+# transient `MemBuf` cursor, and only if the whole decode lowers into the caller
+# does escape analysis keep that cursor on the stack. A multi-field decode
+# exceeds the inlining cost budget, so left to itself the reader escapes into
+# `read_view` and the cursor is forced onto the heap. `@inline` on the generated
+# method does NOT force inlining; a wrapper whose body force-inlines the call
+# (`@inline _read_view_impl(...)`) does.
+@inline read_view(r::CDRReader{B, IsCDR2, LE}, ::Type{T}) where {B <: _CDRBufLike, IsCDR2, LE, T} =
+    @inline _read_view_impl(r, T)
+
 # Generated so the fields lower to a straight-line, left-to-right (in wire
 # order) sequence of `_read_view_field` calls on each concrete `fieldtype(T,i)`
 # — giving the `CDRView` a fully concrete `NamedTuple` type, so it returns by
 # value and allocates nothing (see `_read_view_field` for why a value-level
 # loop would not).
-@generated function read_view(r::CDRReader{B, IsCDR2, LE},
-                              ::Type{T}) where {B <: _CDRBufLike, IsCDR2, LE, T}
+@generated function _read_view_impl(r::CDRReader{B, IsCDR2, LE},
+                                    ::Type{T}) where {B <: _CDRBufLike, IsCDR2, LE, T}
     (isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0) ||
         return :(throw(ArgumentError(string("read_view: ", $T,
                                             " is not a concrete struct with fields"))))
@@ -655,6 +741,35 @@ end
 # this stays strictly less specific than all of them — no dispatch ambiguity);
 # a non-buffer-backed reader errors in `read_view`, which requires one.
 Base.view(r::CDRReader, ::Type{T}) where T = read_view(r, T)
+
+"""
+    read_view(f, buf, ::Type{T})
+
+Read a [`CDRView{T}`](@ref) over a raw byte buffer or `IO` and apply `f` to it
+through a **type-dispatch barrier**, returning `f`'s result.
+
+Constructing a reader from bytes is type-unstable on its own: the encapsulation
+kind (CDR1/CDR2, endianness) is read from `buf` at runtime and carried in the
+reader's type parameters, so a view built *and consumed in the same scope* has
+`Any`-typed fields and boxes every field/element access. Routing the view into
+`f` here dispatches once on the concrete reader type, so `f` — and the
+per-field / per-element work it does — specialises on the concrete view type
+and runs allocation-free:
+
+    total = read_view(buf, PointCloud) do v
+        s = 0.0
+        for p in v.points   # type-stable, no per-element allocation
+            s += p.x
+        end
+        s
+    end
+"""
+@inline read_view(f, buf, ::Type{T}) where {T} = _read_view_barrier(f, CDRReader(buf), T)
+
+# The barrier itself: `@noinline` so it is a genuine call boundary. `r` arrives
+# with a runtime-determined concrete type, dispatch specialises this method on
+# it, and `read_view(r, T)` + `f(view)` are fully typed from here down.
+@noinline _read_view_barrier(f, r::CDRReader, ::Type{T}) where {T} = f(read_view(r, T))
 
 # --- @cdr_view view-struct support -----------------------------------------
 #

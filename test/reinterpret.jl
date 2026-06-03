@@ -498,7 +498,7 @@ end
                    [_RPoint(Float64(i), 2.0, 3.0) for i in 1:N], "frame")
         r = CDRReader(take!(io))
         _use_cloud(r)                       # warmup / compile
-        seek(r.src, 4); r.origin = 4
+        seek(r.src, 4)
         @test (@allocated _use_cloud(r)) == 0
     end
 end
