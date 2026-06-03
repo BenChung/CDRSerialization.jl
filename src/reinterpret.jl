@@ -587,31 +587,36 @@ materialize(a::CDRArray)     = collect(a)
 materialize(a::CDRArrayView) = collect(a)
 materialize(x) = x
 
-# Read one field for `read_view`. Every branch condition is a compile-time
-# constant (a property of `FT`/`IsCDR2`/`LE`), so the compiler prunes this to
-# a single path per field type — no runtime dispatch. Fixed-size parts
+# Read one field for `read_view`. Generated rather than a plain `if`-chain
+# because the branch predicates (`_is_view_eltype`/`_is_cdr1_compat_type`/
+# `_is_packed_type`) return a runtime `Bool` that inference does NOT
+# constant-fold, even though their inputs (`FT`/`IsCDR2`/`LE`) are all known at
+# compile time. A value-level chain would therefore infer as the *union* of
+# every branch's result, degrading the enclosing `CDRView`'s field types to a
+# `Union` and forcing the whole view onto the heap. Deciding the branch here at
+# expansion time emits a single concrete call per field type. Fixed-size parts
 # (primitives, SArrays, all-fixed structs) decode to ordinary values; dynamic
 # CDR sequences become zero-copy `CDRArray` views; nested structs that
 # themselves contain sequences recurse. Sequences whose elements can't be
 # aliased (strings, jagged structs) fall back to a normal decode.
-@inline function _read_view_field(r::CDRReader{B, IsCDR2, LE}, ::Type{FT}) where {B, IsCDR2, LE, FT}
+@generated function _read_view_field(r::CDRReader{B, IsCDR2, LE}, ::Type{FT}) where {B, IsCDR2, LE, FT}
     if FT <: StaticArray || _is_packed_type(FT)
-        return read(r, FT)
+        return :(read(r, $FT))
     elseif FT <: AbstractString
-        return _view_string(r)              # zero-copy CDRString view
+        return :(_view_string(r))           # zero-copy CDRString view
     elseif FT <: AbstractVector
         ET = eltype(FT)
         if _is_view_eltype(ET, IsCDR2, LE)
-            return _view_array(r, ET)       # compact element → zero-copy CDRArray alias
+            return :(_view_array(r, $ET))   # compact element → zero-copy CDRArray alias
         elseif _is_cdr1_compat_type(ET)
-            return _seq_view(r, ET)         # flat (but not compact) element → lazy decoding CDRArrayView
+            return :(_seq_view(r, $ET))     # flat (but not compact) element → lazy decoding CDRArrayView
         else
-            return read(r, FT)              # variable-length element → owned decode
+            return :(read(r, $FT))          # variable-length element → owned decode
         end
     elseif isstructtype(FT) && isconcretetype(FT) && fieldcount(FT) > 0
-        return read_view(r, FT)
+        return :(read_view(r, $FT))
     else
-        return read(r, FT)
+        return :(read(r, $FT))
     end
 end
 
@@ -631,15 +636,18 @@ Sequence fields whose elements can't be aliased (strings, or jagged/dynamic
 element structs) fall back to a normal decode. Only IOBuffer-/MemBuf-backed
 readers are supported.
 """
-@inline function read_view(r::CDRReader{B, IsCDR2, LE},
-                           ::Type{T}) where {B <: _CDRBufLike, IsCDR2, LE, T}
-    isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0 ||
-        throw(ArgumentError(string("read_view: ", T,
-                                   " is not a concrete struct with fields")))
-    # `ntuple(…, Val(N))` unrolls, so each `fieldtype(T, i)` folds to a
-    # concrete type and the tuple is built left-to-right (fields read in order).
-    vals = ntuple(i -> _read_view_field(r, fieldtype(T, i)), Val(fieldcount(T)))
-    return CDRView{T}(NamedTuple{fieldnames(T)}(vals))
+# Generated so the fields lower to a straight-line, left-to-right (in wire
+# order) sequence of `_read_view_field` calls on each concrete `fieldtype(T,i)`
+# — giving the `CDRView` a fully concrete `NamedTuple` type, so it returns by
+# value and allocates nothing (see `_read_view_field` for why a value-level
+# loop would not).
+@generated function read_view(r::CDRReader{B, IsCDR2, LE},
+                              ::Type{T}) where {B <: _CDRBufLike, IsCDR2, LE, T}
+    (isstructtype(T) && isconcretetype(T) && fieldcount(T) > 0) ||
+        return :(throw(ArgumentError(string("read_view: ", $T,
+                                            " is not a concrete struct with fields"))))
+    calls = [:(_read_view_field(r, $(fieldtype(T, i)))) for i in 1:fieldcount(T)]
+    return :(CDRView{$T}(NamedTuple{$(fieldnames(T))}(tuple($(calls...)))))
 end
 
 # `view(r, T)` for a plain struct is an alias of `read_view(r, T)`. The reader
