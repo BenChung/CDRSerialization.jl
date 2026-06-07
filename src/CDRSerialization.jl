@@ -12,6 +12,6 @@ export CDRReader, CDRWriter, CDRSizeCalculator,
        @cdr_fixed, @cdr_compact, @cdr_view, @cdr1_compat,
        reinterpret_struct, reinterpret_array, reinterpret_string, read_view,
        canview, iscompact, cdr_layout, CDRLayout, CDRArray, CDRArrayView, CDRString, CDRView,
-       materialize
+       materialize, retag
 
 end # module CDR

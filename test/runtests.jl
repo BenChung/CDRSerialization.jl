@@ -1043,5 +1043,9 @@ end
     include("reinterpret.jl")
 end
 
+@testset "malformed input (bounds-checked reads)" begin
+    include("malformed.jl")
+end
+
 include("fuzz.jl")
 

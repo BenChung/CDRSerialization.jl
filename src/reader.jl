@@ -221,10 +221,27 @@ end
 
 # Typed `unsafe_load!` directly off the backing buffer — bypasses the
 # peek+skip path in `Base.read(::IOBuffer, ::Type{T})`.
-@inline function _read_prim(buf::_CDRBufLike, ::Type{T}) where T
+@inline function _read_prim(buf::IOBuffer, ::Type{T}) where T
     n = sizeof(T)
     data = _buf_data(buf)
     ptr = _buf_pos(buf)
+    v = GC.@preserve data unsafe_load(Ptr{T}(pointer(data, ptr)))
+    _buf_pos!(buf, ptr + n)
+    return v
+end
+# Cold throw kept out-of-line: constructing the BoundsError boxes the index, and
+# leaving that in an inlined hot read body defeats the escape analysis that keeps
+# the decode zero-alloc. Mirrors Base's `@noinline throw_boundserror`.
+@noinline _throw_buf_bounds(data, idx) = throw(BoundsError(data, idx))
+
+# MemBuf cursor + length come straight off the wire, so validate the load span
+# against the watermark before dereferencing — a truncated/oversized payload must
+# raise rather than read past the buffer. A single compare on the hot path.
+@inline function _read_prim(buf::MemBuf, ::Type{T}) where T
+    n = sizeof(T)
+    data = _buf_data(buf)
+    ptr = _buf_pos(buf)
+    ptr + n - 1 <= _buf_size(buf) || _throw_buf_bounds(data, ptr + n - 1)
     v = GC.@preserve data unsafe_load(Ptr{T}(pointer(data, ptr)))
     _buf_pos!(buf, ptr + n)
     return v
@@ -401,8 +418,12 @@ end
 Base.read(r::CDRReader, ::Type{A}; num=sequenceLength(r)) where A<:AbstractArray{String} = [read(r, String) for i=1:num]
 
 # Vector of user structs (or any other non-primitive element). Reads the
-# length prefix then constructs N inline values.
+# length prefix then constructs N inline values. `num` is wire-supplied; since
+# every non-primitive element occupies at least one byte, a count exceeding the
+# remaining bytes is malformed — reject it up front so a bogus length can't drive
+# a huge allocation or an out-of-bounds field-walk.
 function Base.read(r::CDRReader, ::Type{V}; num=sequenceLength(r)) where {T, V<:AbstractArray{T}}
+    num <= bytesavailable(r.src) || _throw_buf_bounds(r.src, num)
     return [read(r, T) for _ in 1:num]
 end
 
@@ -437,6 +458,7 @@ end
         src = r.src
         data = _buf_data(src)
         ptr = _buf_pos(src)
+        _check_load_span(src, ptr, $sz)
         v = GC.@preserve data unsafe_load(Ptr{$T}(pointer(data, ptr)))
         _buf_pos!(src, ptr + $sz)
         return v
@@ -454,6 +476,16 @@ end
 
 Base.read(r::CDRReader, ::Type{T}) where T = _read_value(r, T)
 
+# A raw `unsafe_load` of `nbytes` at the (1-based) cursor must stay within the
+# data watermark. IOBuffer-backed reads reach here only through the size-checked
+# owned paths, so the guard is a no-op there; a MemBuf is fed directly from the
+# wire, so its span is validated before the dereference (a single compare).
+@inline _check_load_span(::IOBuffer, ptr::Int, nbytes::Int) = nothing
+@inline function _check_load_span(buf::MemBuf, ptr::Int, nbytes::Int)
+    ptr + nbytes - 1 <= _buf_size(buf) || _throw_buf_bounds(_buf_data(buf), ptr + nbytes - 1)
+    return nothing
+end
+
 # Raw-buffer fast path: pull the tuple straight out with `unsafe_load`. The
 # `Ref{NTuple}` form below allocates on Julia 1.11 (escape analysis on 1.12+
 # stack-promotes it, but 1.11 doesn't).
@@ -461,6 +493,7 @@ Base.read(r::CDRReader, ::Type{T}) where T = _read_value(r, T)
     src = r.src
     data = _buf_data(src)
     ptr = _buf_pos(src)
+    _check_load_span(src, ptr, L * sizeof(T))
     nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
     _buf_pos!(src, ptr + L * sizeof(T))
     return SA(nt)
@@ -470,6 +503,7 @@ end
     src = r.src
     data = _buf_data(src)
     ptr = _buf_pos(src)
+    _check_load_span(src, ptr, L * sizeof(T))
     nt = GC.@preserve data unsafe_load(Ptr{NTuple{L, T}}(pointer(data, ptr)))
     _buf_pos!(src, ptr + L * sizeof(T))
     if sizeof(T) > 1

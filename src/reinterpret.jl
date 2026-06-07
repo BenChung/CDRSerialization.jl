@@ -269,11 +269,16 @@ end
     kind = r.kind
     first_pos = _buf_pos(src)
     n == 0 && return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, first_pos, 0, 0)
-    read(r, E)                                   # consume element 1
+    read(r, E)                                   # consume element 1 (bounds-checked)
     second_pos = _buf_pos(src)
     n == 1 && return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, second_pos, second_pos - first_pos, 1)
     read(r, E)                                   # consume element 2 → measure steady stride
     stride = _buf_pos(src) - second_pos
+    # `n` is wire-supplied; the last element ends at `second_pos - 1 + (n-1)*stride`.
+    # Reject a span that runs past the buffer before advancing or aliasing it, so a
+    # bogus length can't drive out-of-bounds element decodes.
+    second_pos - 1 + (n - 1) * stride <= _buf_size(src) ||
+        _throw_buf_bounds(mem, second_pos - 1 + (n - 1) * stride)
     _buf_pos!(src, second_pos + (n - 1) * stride) # advance past the remaining elements
     return CDRArrayView{E, IsCDR2, LE, S}(mem, origin, kind, first_pos, second_pos, stride, n)
 end
@@ -661,6 +666,37 @@ materialize(s::CDRString)    = String(s)
 materialize(a::CDRArray)     = collect(a)
 materialize(a::CDRArrayView) = collect(a)
 materialize(x) = x
+
+# --- retag: zero-copy re-tag of a struct view to a layout-compatible type ----
+#
+# Equal field layout (the caller's contract — e.g. equal RIHS01) means a `CDRView`'s
+# byte-offset accessors are valid under a different nominal type `S`, so the same buffer
+# can be presented as `CDRView{S}` without reading or copying any bytes. Nested
+# struct-view fields are recursively re-tagged to `S`'s corresponding field types (still
+# zero-copy — only the lightweight view wrappers are rebuilt); scalar / string / array
+# fields are shared as-is. Residual: a `Vector` of nested *messages* keeps the source
+# view's element type (its elements aren't a `CDRView` field to recurse into); flat and
+# single-nested messages re-tag fully. Field names/order match across `T` and `S` by the
+# layout-identity contract (a shared descriptor ⇒ shared RIHS01 ⇒ shared field names).
+"""
+    retag(v::CDRView{T}, ::Type{S}) -> CDRView{S}
+
+Re-tag a struct view to a layout-compatible type `S` (equal field layout — the caller's
+contract, e.g. equal RIHS01), zero-copy: the same buffer is presented under `S` with no
+bytes read or copied. Nested struct-view fields are recursively re-tagged to `S`'s field
+types. Identity when `T === S`. `reinterpret(CDRView{S}, v)` is an alias.
+"""
+function retag(v::CDRView{T}, ::Type{S}) where {T, S}
+    T === S && return v
+    f = getfield(v, :fields)
+    vals = ntuple(fieldcount(S)) do i
+        x = getfield(f, fieldname(S, i))
+        x isa CDRView ? retag(x, fieldtype(S, i)) : x
+    end
+    return CDRView{S}(NamedTuple{fieldnames(S)}(vals))
+end
+
+Base.reinterpret(::Type{CDRView{S}}, v::CDRView) where {S} = retag(v, S)
 
 # Read one field for `read_view`. Generated rather than a plain `if`-chain
 # because the branch predicates (`_is_view_eltype`/`_is_cdr1_compat_type`/
