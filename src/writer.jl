@@ -27,6 +27,22 @@ end
 CDRWriter(mem::DenseVector{UInt8}, kind::EncapsulationKind=CDR_LE) =
     CDRWriter(MemBuf(mem, 1, 0), kind)
 
+# Kind-explicit construction, mirroring `CDRReader(buf, Val(CDR_LE))`. The runtime-kind
+# `CDRWriter(buf[, kind])` derives `IsCDR2`/`LE` from a value, so its type — and thus the
+# `write` dispatched on it — is runtime-determined; inference can't pin it, so a caller
+# encoding into a fresh buffer pays a dynamic dispatch (and box) on `write`. Declaring the
+# kind up front fixes the type at the call site. @generated so kind → (IsCDR2, LE) splits
+# at expansion; routes through the runtime-kind ctor (which writes + validates the preamble)
+# then asserts the now-known concrete type.
+@generated function CDRWriter(buf::B, ::Val{K}) where {B <: _CDRBufLike, K}
+    K isa EncapsulationKind ||
+        return :(throw(ArgumentError(string("CDRWriter: expected an EncapsulationKind, got ",
+                                            $(QuoteNode(K))))))
+    isCDR2, le, _, _ = getEncapsulationKind(UInt8(K))
+    return :(CDRWriter(buf, $K)::CDRWriter{$isCDR2, $le, B})
+end
+CDRWriter(mem::DenseVector{UInt8}, v::Val) = CDRWriter(MemBuf(mem, 1, 0), v)
+
 @inline isCDR2(::CDRWriter{B}) where B = B
 @inline littleEndian(::CDRWriter{<:Any, L}) where L = L
 
