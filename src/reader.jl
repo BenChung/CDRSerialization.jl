@@ -274,9 +274,9 @@ function Base.read(r::CDRReader, ::Type{String}, len::Integer)
         return ""
     end
     bytes = read(r.src, len)
-    if bytes[end] == 0x00
-        bytes = @view bytes[1:end-1]
-    end
+    # CDR strings are NUL-terminated; trim the terminator in place, then steal the
+    # freshly-read buffer into the String (zero-copy) — one copy total, not two.
+    bytes[end] == 0x00 && resize!(bytes, length(bytes) - 1)
     return String(bytes)
 end
 
