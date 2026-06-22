@@ -547,9 +547,18 @@ end
 _cv_branch(r) = canview(r, CDRArray{_RPoint}) ? 1 : 2
 _ic_branch(r) = iscompact(r, _RPose) ? 1 : 2
 _pick(r)      = canview(r, CDRArray{_RPoint}) ? view(r, CDRArray{_RPoint}) : read(r, Vector{_RPoint})
+# The predicate folded iff the branch specialized to a constant: exactly one
+# ReturnNode of an `Int` literal, with no surviving conditional. A genuine
+# non-fold leaves a `goto if not` and two returns. We don't require
+# `length(code) == 1` — eliminating the now-constant predicate call (or the
+# `_RPose` global load behind it) is the optimizer's discretion and varies by
+# build/world-age, so a leftover effect-free statement is tolerated.
 function _folds_to_literal(f, RT)
     code = code_typed(f, (RT,); optimize=true)[1].first.code
-    length(code) == 1 && code[1] isa Core.ReturnNode && code[1].val isa Int
+    rets = findall(x -> x isa Core.ReturnNode, code)
+    length(rets) == 1 || return false
+    r = code[rets[1]]
+    isdefined(r, :val) && r.val isa Int && !any(x -> x isa Core.GotoIfNot, code)
 end
 
 @testset "canview / iscompact: compile-time-foldable predicates" begin
